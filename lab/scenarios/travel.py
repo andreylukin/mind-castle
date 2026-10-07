@@ -160,8 +160,7 @@ for kind in kinds:
             st, _ = travel(st, dst, kind, "D", f"{names[src]} -> {names[dst]}")
 
 # ---------------------------------------------------------------- replay of the user's real gestures (local file)
-GESTURES = os.environ.get("TRAVEL_GESTURES",
-                          "/private/tmp/claude-501/-Users-andrey/d00ade63-1868-4af1-9070-2d4b6a936801/scratchpad/user_gestures.json")
+GESTURES = os.environ.get("TRAVEL_GESTURES", "")  # path to a local gestures.json; never commit recordings
 if os.path.exists(GESTURES):
     import json
     import re
