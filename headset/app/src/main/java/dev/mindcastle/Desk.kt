@@ -141,7 +141,9 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
         const val PANEL_SCALE = 0.4f // Retina pixels -> dp, shrunk so a laptop-sized window fits
         const val CORNER_IN = 10f // corner handle reaches this far into the content...
         const val CORNER_OUT = 28f // ...and this far outside it
-        const val MAX_T = 1.7320508f // cursor elevation limit (tan 60°); around the arc the cursor wraps freely
+        const val MAX_T = 1.7320508f // absolute elevation limit (tan 60°); around the arc the cursor wraps freely
+        const val ELEV_MARGIN_DEG = 15f // the cursor may go this far above/below the panels...
+        const val ELEV_FALLBACK_DEG = 35f // ...or ±this with no panels
         const val JUMP_IDLE_MS = 500L
         const val TIDY_MAX_DEG = 50f // widest a window gets when tidied
         const val GESTURE_GAP_MS = 150L // a pause this long ends a travel gesture (for the log)
@@ -501,10 +503,23 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
     /** dp per Mac point where the cursor is: the window's own scale over content, GAIN elsewhere. */
     fun cursorDpPerPoint(): Float = if (overContent) hover?.let { dpPerPoint(it.id) } ?: GAIN else GAIN
 
-    /** Speed-dependent cursor gain on top of macOS's own (see [Accel]); the app turns it on, tests opt in. */
+    /**
+     * The real-trackpad pointer model (see [Accel]): speed-dependent gain on top of macOS's, spike
+     * rejection, an 8° per-message cap and an elevation band that acts as a wall. The app turns it on;
+     * unit tests use exact raw deltas unless they opt in.
+     */
     var acceleration = false
-    /** Smoothed pointer speed, Mac points per second. */
+    /** Pointer speed, Mac points per second, over the last [Accel.WINDOW_MS] of deltas. */
     var speed = 0f; private set
+    private val speedSamples = ArrayDeque<Pair<Long, Float>>() // (t, |delta|)
+
+    private fun speedWindow(mag: Float, nowMs: Long): Float {
+        speedSamples.addLast(nowMs to mag)
+        while (speedSamples.first().first < nowMs - Accel.WINDOW_MS) speedSamples.removeFirst()
+        // Time the window's deltas took: from just before its first sample (one nominal interval) to now.
+        val span = (nowMs - speedSamples.first().first + Accel.NOMINAL_DT_MS).coerceAtLeast(Accel.NOMINAL_DT_MS)
+        return speedSamples.sumOf { it.second.toDouble() }.toFloat() * 1000f / span
+    }
     /** Per-gesture travel summary for the log (a gesture = moves without a [GESTURE_GAP_MS] pause). */
     var onGesture: (String) -> Unit = {}
     private var gestureStartMs = 0L
@@ -551,11 +566,13 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
         val out = mutableListOf<Action>()
         val dt = nowMs - lastPointerMs
         val idle = dt >= JUMP_IDLE_MS
-        // Speed from this message's travel over the time since the last one (≈ 8 ms at 120 Hz; a
-        // first message or a pause counts as one nominal interval), lightly smoothed.
-        val inst = hypot(p.dx, p.dy) * 1000f / (if (dt in 1..Accel.MAX_DT_MS) dt else Accel.NOMINAL_DT_MS).toFloat()
-        speed = if (dt > Accel.MAX_DT_MS) inst else 0.5f * speed + 0.5f * inst
-        trackGesture(p, nowMs, dt)
+        // A single delta this big is a warp artifact (seen on device: 250–1745 pt in one message), not
+        // the user: drop the motion, keep buttons/scroll.
+        val spike = acceleration && hypot(p.dx, p.dy) > Accel.SPIKE_PT
+        if (spike) onGesture("spike: dropped POINTER dx=%.0f dy=%.0f".format(p.dx, p.dy))
+        val pm = if (spike) p.copy(dx = 0f, dy = 0f) else p
+        speed = speedWindow(hypot(pm.dx, pm.dy), nowMs)
+        trackGesture(pm, nowMs, dt)
         lastPointerMs = nowMs
         // Only a plain move after a pause jumps: never a press/scroll, never mid-drag, never while
         // parked on a grab bar or corner (the user is about to grab it).
@@ -569,13 +586,17 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
         if (!absorb) absorbUntilMs = Long.MIN_VALUE
         val cap = captured?.let { id -> _panels[id]?.let { id to it } }
         if (absorb) Unit
-        else if (cap != null) moveCaptured(cap.first, cap.second, p.dx, p.dy)
-        else moveGain().let { g -> moveCursor(p.dx * g, p.dy * g) }
+        else if (cap != null) moveCaptured(cap.first, cap.second, pm.dx, pm.dy)
+        else moveGain().let { g ->
+            // Vertical gets far less acceleration: an over-eager dy is what flung the cursor to the floor.
+            val gy = if (acceleration) min(g, cursorDpPerPoint() * Accel.VERT_MAX) else g
+            moveCursor(pm.dx * g, pm.dy * gy)
+        }
         drag?.let { applyDrag(it) }
         hover = drag?.h ?: captured?.let { Hover(it, Zone.CONTENT) } ?: hit()
         hover?.let { cursorR = _panels.getValue(it.id).r }
 
-        val moved = p.dx != 0f || p.dy != 0f
+        val moved = pm.dx != 0f || pm.dy != 0f
         val m = mouse
         if (moved && m != null) mouseAt(m.first, "drag", m.second)?.let { out += it }
         else if (moved && drag == null) hover?.takeIf { it.zone == Zone.CONTENT && it.id != PICKER }
@@ -599,8 +620,32 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
     private fun moveCursor(dx: Float, dy: Float) {
         // Mac dy is down-positive. Angular motion at the current radius keeps 1 point ≈ GAIN dp on the panel.
         val r = hover?.let { _panels[it.id]?.r } ?: cursorR
-        cursorTheta = wrapAngle(cursorTheta + dx / r)
-        cursorT = (cursorT - dy / r).coerceIn(-MAX_T, MAX_T)
+        if (!acceleration) { // raw model (tests): exact deltas, only the absolute ±60° limit
+            cursorTheta = wrapAngle(cursorTheta + dx / r)
+            cursorT = (cursorT - dy / r).coerceIn(-MAX_T, MAX_T)
+            return
+        }
+        val maxStep = rad(Accel.MAX_STEP_DEG) // no single message moves the cursor further than this
+        cursorTheta = wrapAngle(cursorTheta + (dx / r).coerceIn(-maxStep, maxStep))
+        // Elevation as an angle so the step cap and the band are in degrees.
+        val e0 = atan(cursorT)
+        val e1 = e0 - (dy / r).coerceIn(-maxStep, maxStep)
+        val (lo, hi) = elevationBand()
+        // A wall, never a jump: past an edge (panels moved since) you can only come back toward the band.
+        val e = when {
+            e1 > hi -> if (e0 > hi) min(e1, e0) else hi
+            e1 < lo -> if (e0 < lo) max(e1, e0) else lo
+            else -> e1
+        }
+        cursorT = tan(e).coerceIn(-MAX_T, MAX_T)
+    }
+
+    /** Elevations (radians) the cursor may use: the panels' vertical extent ± [ELEV_MARGIN_DEG]. */
+    fun elevationBand(): Pair<Float, Float> {
+        if (_panels.isEmpty()) return -rad(ELEV_FALLBACK_DEG) to rad(ELEV_FALLBACK_DEG)
+        val lo = _panels.values.minOf { atan((it.y + Bar.v(it) - Bar.H) / it.r) } - rad(ELEV_MARGIN_DEG)
+        val hi = _panels.values.maxOf { atan((it.y + it.h / 2) / it.r) } + rad(ELEV_MARGIN_DEG)
+        return max(lo, -atan(MAX_T)) to min(hi, atan(MAX_T))
     }
 
     /**
@@ -886,7 +931,10 @@ object Accel {
     const val MAX = 3.5f
     const val GAP_MIN = 1.5f // empty space always moves at least this much faster than 1×
     const val NOMINAL_DT_MS = 8L // POINTER is coalesced to ≤120/s
-    const val MAX_DT_MS = 100L // longer than this since the last message: a new movement
+    const val WINDOW_MS = 50L // speed = travel over this much recent time (per-message dt is too jittery)
+    const val SPIKE_PT = 200f // one message moving more than this is a warp artifact: dropped
+    const val VERT_MAX = 1.5f // vertical acceleration cap
+    const val MAX_STEP_DEG = 8f // no single POINTER moves the cursor further than this, either axis
 
     fun factor(speedPtPerS: Float): Float = when {
         speedPtPerS <= SLOW -> 1f

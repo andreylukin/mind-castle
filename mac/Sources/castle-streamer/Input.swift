@@ -154,9 +154,17 @@ func tagInjected(_ ev: CGEvent) {
     ev.setIntegerValueField(.eventSourceUserData, value: castleEventTag)
 }
 
+private var lastPosted: CGPoint?
+
 private func postTagged(_ ev: CGEvent?) {
     guard let ev else { return }
     tagInjected(ev)
+    // Posting a located mouse event warps the (detached) cursor; a big jump can leak into the next physical delta.
+    if ev.type != .keyDown && ev.type != .keyUp {
+        let p = ev.location
+        if let l = lastPosted { control.noteInjectedJump(hypot(p.x - l.x, p.y - l.y)) }
+        lastPosted = p
+    }
     ev.post(tap: .cghidEventTap)
 }
 

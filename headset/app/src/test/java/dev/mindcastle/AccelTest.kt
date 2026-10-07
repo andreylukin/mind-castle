@@ -49,7 +49,7 @@ class AccelTest {
 
     @Test fun gapsAreCrossedAtLeastFasterThanBase() {
         val d = desk()
-        d.pointer(Pointer(dy = -400f), nowMs = 1) // up into empty space
+        repeat(4) { d.pointer(Pointer(dy = -100f), nowMs = 1L + it * 200) } // up into empty space (no single spike)
         d.pointer(Pointer(), nowMs = 1_000)
         assertEquals(null, d.hover)
         val t0 = d.cursorTheta

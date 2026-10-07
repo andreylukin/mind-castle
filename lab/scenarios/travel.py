@@ -5,8 +5,8 @@ Swipes are POINTER bursts at ~120 Hz with a 150 ms finger-lift gap after each:
   slow   300 pt/s for 0.5 s  (150 pt)
   normal 1200 pt/s for 0.4 s (480 pt)
   flick  3000 pt/s for 0.25 s (750 pt)
-The simulated user aims at the target's center: each swipe heads for it and is cut short when the remaining
-distance (estimated at 1 dp/pt, which is all the user can know) is less than a full swipe. After each swipe the
+The simulated user aims at the target's center and lifts the finger as soon as the cursor is on the target
+(predicted per message with the app's gain + acceleration model, TRAVEL_ACCEL=0 for older builds). After each swipe the
 app's state is read; the path is done when the cursor is on the target. Pass: ≤ 2 normal swipes, ≤ 1 flick.
 
 Layout D mirrors the user's device layout (12:43): picker θ -1.301; A θ -0.671 1289 wide at r≈1360;
@@ -27,15 +27,59 @@ HZ = 120.0
 ROWS = []  # (section, path, kind, swipes, seconds, ok, note)
 
 
-def swipe(ux, uy, kind, length=None, buttons=None):
-    """One swipe along unit vector (ux, uy) in Mac points (y down). Returns seconds spent."""
+ACCEL = os.environ.get("TRAVEL_ACCEL", "1") != "0"  # model the app's pointer acceleration (build ≥ 2026-10-07)
+
+
+def accel_factor(speed):
+    """Desk Accel: 1× up to 400 pt/s, linear to 3.5× at 2500 pt/s, flat beyond."""
+    if not ACCEL or speed <= 400:
+        return 1.0
+    return 1.0 + 2.5 * min(1.0, (speed - 400) / 2100)
+
+
+def zone_at(panels, theta, t):
+    """(id, 'CONTENT'|'OTHER') of the nearest panel under (theta, t) using Desk's plane model, or (None, None)."""
+    best = (None, None, 1e9)
+    for pid, p in panels.items():
+        d = wrap(theta - p["theta"])
+        if math.cos(d) < 0.3:
+            continue
+        u, v = p["r"] * math.tan(d), p["r"] * t - p["y"]
+        if abs(u) <= p["w"] / 2 and abs(v) <= p["h"] / 2 and p["r"] < best[2]:
+            best = (pid, "CONTENT" if pid else "OTHER", p["r"])
+    return best[0], best[1]
+
+
+def predicted_gain(panels, theta, t, speed):
+    """dp per Mac point the app applies here at this speed (the user 'sees' this; we predict it to stop on time)."""
+    pid, zone = zone_at(panels, theta, t)
+    f = accel_factor(speed)
+    if pid is None:
+        return max(1.5, f) if ACCEL else 1.0
+    if zone == "CONTENT":
+        native = panels[pid]["w"] / lab.WINDOW_PTS[pid] if pid in lab.WINDOW_PTS else 0.8
+        return native if f == 1.0 else f
+    return f
+
+
+def swipe(ux, uy, kind, length=None, buttons=None, stop=None, st=None):
+    """One swipe along unit vector (ux, uy) in Mac points (y down), like a finger: constant speed at ~120 Hz.
+    [stop](theta, t) -> bool lets the simulated user lift the finger once the (predicted) cursor is on target;
+    without it the swipe runs its full length (or [length] points). Returns seconds spent."""
     speed, dur = PROFILES[kind]
     total = speed * dur if length is None else min(length, speed * dur)
     n = max(1, int(total / speed * HZ))
     step = total / n
+    th, t = (st["cursor"]["theta"], st["cursor"]["t"]) if st else (0.0, 0.0)
     t0 = time.time()
     for i in range(n):
         lab.pointer(ux * step, uy * step, buttons)
+        if st is not None:
+            r = lab._cursor_r(st)
+            g = predicted_gain(st["panels"], th, t, speed)
+            th, t = wrap(th + ux * step * g / r), t - uy * step * g / r
+            if stop and stop(th, t):
+                break
         nxt = t0 + (i + 1) / HZ
         time.sleep(max(0.0, nxt - time.time()))
     time.sleep(0.15)  # finger lift
@@ -72,7 +116,14 @@ def travel(st, target, kind, section, label, allow_wrap=False, start=None):
         if dist < 1:
             break
         before = dict(st["cursor"])
-        t_spent += swipe(dx / dist, dy / dist, kind, length=dist)
+        tgt = st["panels"][target]
+
+        def reached(th, t, tgt=tgt):
+            u = tgt["r"] * math.tan(wrap(th - tgt["theta"]))
+            v = tgt["r"] * t - tgt["y"]
+            return abs(u) <= 0.4 * tgt["w"] and abs(v) <= 0.4 * tgt["h"]
+        # The user looks at the cursor and lifts when it's on the target (predicted with the app's gain model).
+        t_spent += swipe(dx / dist, dy / dist, kind, stop=reached, st=st)
         swipes += 1
         st = lab.state()
         moved = math.hypot(wrap(st["cursor"]["theta"] - before["theta"]), st["cursor"]["t"] - before["t"])

@@ -274,7 +274,8 @@ def keepalive(on=True):
 
 def move_smooth(dx, dy, steps=None, dt=0.008, buttons=None):
     """Move by (dx, dy) Mac points in small steps, like a finger on the trackpad."""
-    steps = steps or max(1, int(max(abs(dx), abs(dy)) / 4))
+    # 3 pt per 8 ms = 375 pt/s: below the app's acceleration threshold (400 pt/s), so gains stay predictable.
+    steps = steps or max(1, int(max(abs(dx), abs(dy)) / 3))
     sent = [0.0, 0.0]
     for i in range(1, steps + 1):
         x, y = dx * i / steps, dy * i / steps
@@ -748,13 +749,19 @@ def _cursor_r(st):
 
 
 def _gain(st):
-    """dp per Mac point where the cursor is; native gain over window content (panel w / window points)."""
+    """dp per Mac point where the cursor is, for slow (≤ 400 pt/s, unaccelerated) moves: native over window
+    content (panel w / window points), 1.0 on the picker/bars/corners, 1.5 in empty space (the app's floor there)."""
     h = st.get("hover")
-    if h and h["zone"] == "CONTENT" and h["id"] != 0:
+    if h is None:
+        return GAP_GAIN
+    if h["zone"] == "CONTENT" and h["id"] != 0:
         w = WINDOW_PTS.get(h["id"])
         if w:
             return st["panels"][h["id"]]["w"] / w
     return 1.0
+
+
+GAP_GAIN = float(os.environ.get("LAB_GAP_GAIN", "1.5"))  # set 1.0 for pre-acceleration builds
 
 
 # id -> window width in Mac points (WINDOW_LIST pixels / 2), for native gain over content. Known for the fake backend.

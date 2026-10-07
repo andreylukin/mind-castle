@@ -50,6 +50,41 @@ final class ControlMode {
     private var gammaTimer: Timer?
     private var cursor: CursorWatcher?
     private var lab = false
+
+    // Spurious physical deltas (PROTOCOL v1 POINTER): when an injected MOUSE move/click warps the hidden cursor far,
+    // macOS can add the warp to the next physical event's delta (seen: single events of 250-1745 pt vs p99 ~91).
+    static let spikeFloor = 200.0, spikeFactor = 8.0, postWarpLimit = 100.0, bigJump = 150.0
+    private var recentMags: [Double] = [] // magnitudes of the last 20 accepted physical moves
+    private var warpPending = false
+    private let warpLock = NSLock()
+    private(set) var droppedSpikes = 0
+
+    /// From Input.swift (any thread): an injected event moved the cursor by `distance` points.
+    func noteInjectedJump(_ distance: Double) {
+        guard distance > Self.bigJump else { return }
+        warpLock.lock(); warpPending = true; warpLock.unlock()
+    }
+
+    /// True if this physical delta is a warp artifact or an outlier: drop it.
+    private func isSpurious(_ dx: Double, _ dy: Double) -> Bool {
+        let m = hypot(dx, dy)
+        warpLock.lock()
+        let afterWarp = warpPending
+        warpPending = false
+        warpLock.unlock()
+        let median = recentMags.isEmpty ? 0 : recentMags.sorted()[recentMags.count / 2]
+        let limit = afterWarp ? Self.postWarpLimit : max(Self.spikeFloor, Self.spikeFactor * median)
+        if m > limit {
+            droppedSpikes += 1
+            log("control: dropped spurious delta (\(Int(dx)),\(Int(dy)))\(afterWarp ? " after an injected jump" : "")")
+            return true
+        }
+        if m > 0 {
+            recentMags.append(m)
+            if recentMags.count > 20 { recentMags.removeFirst() }
+        }
+        return false
+    }
     /// Key hook for other features (push-to-talk, v5): sees every key event the ⌃⌥⌘ hotkeys didn't swallow, except
     /// events tagged `castleEventTag` (our own injected keys pass straight through). Args: event type (.keyDown/.keyUp;
     /// autorepeat via `.keyboardEventAutorepeat`), the event, control mode on. Return true to swallow.
@@ -269,8 +304,10 @@ final class ControlMode {
         acc.mods = Self.mods(ev.flags)
         switch type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-            acc.dx += ev.getDoubleValueField(.mouseEventDeltaX)
-            acc.dy += ev.getDoubleValueField(.mouseEventDeltaY)
+            let dx = ev.getDoubleValueField(.mouseEventDeltaX), dy = ev.getDoubleValueField(.mouseEventDeltaY)
+            if isSpurious(dx, dy) { return true } // still swallowed, just not forwarded
+            acc.dx += dx
+            acc.dy += dy
             acc.dirty = true
         case .scrollWheel:
             acc.sy += ev.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1)
@@ -583,6 +620,44 @@ func controlSelfTest() -> Bool {
     check(state(inj("down", CGPoint(x: 120, y: 100), 1, 400.2)) == 1, "other button restarts at 1")
     check(state(inj("drag", CGPoint(x: 150, y: 100), 1, 400.3)) == 1, "drag carries the press's click state")
     _ = inj("up", CGPoint(x: 150, y: 100), 1, 400.4)
+
+    // Spike guard: replay the shape of the user's real trace (small moves with isolated warp spikes).
+    let sc = ControlMode()
+    sc.autoControl = false
+    var spSent: [[String: Any]] = []
+    sc.clientConnected { t, p in if t == Msg.pointer { spSent.append((try? JSONSerialization.jsonObject(with: p)) as? [String: Any] ?? [:]) } }
+    for d in [true, false] { let e = CGEvent(keyboardEventSource: nil, virtualKey: 46, keyDown: d)!; e.flags = [.maskControl, .maskAlternate, .maskCommand]; _ = sc.handle(d ? .keyDown : .keyUp, e) }
+    var sclock = 100.0
+    sc.now = { sclock }
+    func smove(_ dx: Double, _ dy: Double) -> Bool {
+        sclock += 0.01 // 10 ms apart: every event flushes on its own
+        let e = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: .zero, mouseButton: .left)!
+        e.setDoubleValueField(.mouseEventDeltaX, value: dx)
+        e.setDoubleValueField(.mouseEventDeltaY, value: dy)
+        return sc.handle(.mouseMoved, e)
+    }
+    let real: [(Double, Double)] = [(5, -2), (6, 1), (31, 12), (-8, 4), (91, -20), (3, 3), (-12, 6), (40, 25), (7, -1), (2, 2)]
+    for (dx, dy) in real { _ = smove(dx, dy) }
+    let spikes: [(Double, Double)] = [(-1015, 730), (932, -314), (-1063, -43), (751, 952), (254, 161)]
+    var swallowedAll = true
+    for (dx, dy) in spikes {
+        swallowedAll = swallowedAll && smove(dx, dy)
+        _ = smove(65, -43) // the real move right after a spike (from the user's trace) must survive
+    }
+    let fwd = spSent.reduce((0.0, 0.0)) { ($0.0 + ((($1["dx"] as? NSNumber)?.doubleValue) ?? 0), $0.1 + ((($1["dy"] as? NSNumber)?.doubleValue) ?? 0)) }
+    let wantX = real.reduce(0) { $0 + $1.0 } + 5 * 65, wantY = real.reduce(0) { $0 + $1.1 } - 5 * 43
+    check(swallowedAll && sc.droppedSpikes == 5, "spike guard drops the 5 warp spikes (\(sc.droppedSpikes)), still swallows them")
+    check(fwd.0 == wantX && fwd.1 == wantY, "spike guard forwards all real motion incl. 91 pt and post-spike moves (sum \(fwd) vs \(wantX),\(wantY))")
+    // After an injected jump (>150 pt), a mid-size spike (191,-125 in the user's trace) is also dropped; small moves pass.
+    sc.noteInjectedJump(600)
+    check(!smove(191, -125) || sc.droppedSpikes == 6, "post-jump limit drops a 228 pt delta")
+    sc.noteInjectedJump(600)
+    let before = sc.droppedSpikes
+    _ = smove(20, 10)
+    check(sc.droppedSpikes == before, "post-jump limit keeps a normal 22 pt move")
+    sc.noteInjectedJump(40) // hover-sized injected move: no extra strictness
+    _ = smove(150, 0)
+    check(sc.droppedSpikes == before, "small injected moves (hover) don't arm the post-jump limit (150 pt flick kept)")
 
     // Auto control mode: ON when a headset connects, OFF on disconnect; manual OFF sticks until the next connect.
     var autoApplied: [Bool] = [], autoSent: [String] = []
