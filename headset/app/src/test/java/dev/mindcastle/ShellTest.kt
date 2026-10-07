@@ -103,4 +103,16 @@ class ShellTest {
             java.nio.ByteBuffer.wrap(Glb.write(m.positions, m.indices, floatArrayOf(0f, 0f, 0f, 1f))).order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt(12)).trim())
             .getJSONArray("materials").getJSONObject(0).getString("alphaMode"))
     }
+
+    @Test fun cutoutRegion() {
+        val f = 0f; val half = Shell.WINDOW_HALF_YAW; val top = Shell.WINDOW_PITCH_TOP
+        fun dir(yawDeg: Float, elevDeg: Float): Vec3 {
+            val y = rad(yawDeg); val e = rad(elevDeg)
+            return Vec3(kotlin.math.sin(y) * kotlin.math.cos(e), kotlin.math.sin(e), -kotlin.math.cos(y) * kotlin.math.cos(e))
+        }
+        assertTrue("down at the keyboard", Shell.inCutout(dir(0f, -40f), f, half, top))
+        assertTrue(!Shell.inCutout(dir(0f, 0f), f, half, top))
+        assertTrue("beside the cutout", !Shell.inCutout(dir(40f, -40f), f, half, top))
+        assertTrue("follows forward", Shell.inCutout(dir(90f, -40f), rad(90f), half, top))
+    }
 }

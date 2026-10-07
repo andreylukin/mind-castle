@@ -56,13 +56,26 @@ final class ControlMode {
     static let spikeFloor = 200.0, spikeFactor = 8.0, postWarpLimit = 100.0, bigJump = 150.0
     private var recentMags: [Double] = [] // magnitudes of the last 20 accepted physical moves
     private var warpPending = false
+    private var lastWarp: (from: CGPoint, to: CGPoint, t: Double)? // most recent injected cursor move, for spike logs
     private let warpLock = NSLock()
     private(set) var droppedSpikes = 0
+    /// `--warp-compensate`: subtract the injected warps since the previous physical move from its delta
+    /// (live logs showed spikes equal to warps 5-9 ms earlier; fit k with tools/fit_warp.py on a --trace-input trace).
+    var warpCompensate = false
+    /// `--no-detach` turns this off (A/B: does an attached cursor keep injected warps out of physical deltas?).
+    var detachCursor = true
+    private var statSpikes = 0
+    private var warpSum = CGPoint.zero // injected (to - from) since the last physical move
 
-    /// From Input.swift (any thread): an injected event moved the cursor by `distance` points.
-    func noteInjectedJump(_ distance: Double) {
-        guard distance > Self.bigJump else { return }
-        warpLock.lock(); warpPending = true; warpLock.unlock()
+    /// From Input.swift (any thread): an injected event moved the cursor from `from` to `to` (global points).
+    func noteInjectedMove(from: CGPoint, to: CGPoint) {
+        Trace.shared.warp(from: from, to: to)
+        warpLock.lock()
+        lastWarp = (from, to, ProcessInfo.processInfo.systemUptime)
+        warpSum.x += to.x - from.x
+        warpSum.y += to.y - from.y
+        if hypot(to.x - from.x, to.y - from.y) > Self.bigJump { warpPending = true }
+        warpLock.unlock()
     }
 
     /// True if this physical delta is a warp artifact or an outlier: drop it.
@@ -71,12 +84,19 @@ final class ControlMode {
         warpLock.lock()
         let afterWarp = warpPending
         warpPending = false
+        let warp = lastWarp
         warpLock.unlock()
         let median = recentMags.isEmpty ? 0 : recentMags.sorted()[recentMags.count / 2]
         let limit = afterWarp ? Self.postWarpLimit : max(Self.spikeFloor, Self.spikeFactor * median)
         if m > limit {
             droppedSpikes += 1
-            log("control: dropped spurious delta (\(Int(dx)),\(Int(dy)))\(afterWarp ? " after an injected jump" : "")")
+            statSpikes += 1
+            // Debug: the latest injected warp, to confirm (from real use) that spikes follow warps.
+            let w = warp.map { w in
+                String(format: "; last injected warp (%.0f,%.0f)->(%.0f,%.0f) = (%.0f,%.0f), %.0f ms ago", w.from.x, w.from.y, w.to.x, w.to.y,
+                       w.to.x - w.from.x, w.to.y - w.from.y, (ProcessInfo.processInfo.systemUptime - w.t) * 1000)
+            } ?? "; no injected warp yet"
+            log("control: dropped spurious delta (\(Int(dx)),\(Int(dy)))\(afterWarp ? " after an injected jump" : "")\(w)")
             return true
         }
         if m > 0 {
@@ -247,7 +267,7 @@ final class ControlMode {
             } else {
                 log("control: could not create mouse event tap")
             }
-            CGAssociateMouseAndMouseCursorPosition(0) // cursor stays put: no hot corners / Dock reveal
+            if detachCursor { CGAssociateMouseAndMouseCursorPosition(0) } // cursor stays put: no hot corners / Dock reveal
             Self.blackOutBuiltin()
             // macOS can reset gamma (Night Shift, True Tone, display reconfig); keep it black.
             let t = Timer(timeInterval: 1, repeats: true) { _ in Self.blackOutBuiltin() }
@@ -304,8 +324,15 @@ final class ControlMode {
         acc.mods = Self.mods(ev.flags)
         switch type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-            let dx = ev.getDoubleValueField(.mouseEventDeltaX), dy = ev.getDoubleValueField(.mouseEventDeltaY)
-            if isSpurious(dx, dy) { return true } // still swallowed, just not forwarded
+            var dx = ev.getDoubleValueField(.mouseEventDeltaX), dy = ev.getDoubleValueField(.mouseEventDeltaY)
+            warpLock.lock()
+            let w = warpSum
+            warpSum = .zero
+            warpLock.unlock()
+            if warpCompensate { dx -= w.x; dy -= w.y }
+            let spurious = isSpurious(dx, dy)
+            Trace.shared.rawMove(dx: dx, dy: dy, dropped: spurious)
+            if spurious { return true } // still swallowed, just not forwarded
             acc.dx += dx
             acc.dy += dy
             acc.dirty = true
@@ -434,7 +461,8 @@ final class ControlMode {
         send?(Msg.pointer, acc.take())
         statPointers += 1
         if lastSent - statSince >= 2 {
-            log("control: sent \(statPointers) POINTER msgs in last \(String(format: "%.1f", lastSent - statSince))s")
+            log("control: sent \(statPointers) POINTER msgs in last \(String(format: "%.1f", lastSent - statSince))s, dropped \(statSpikes) spurious deltas")
+            statSpikes = 0
             statPointers = 0; statSince = lastSent
         }
     }
@@ -649,15 +677,43 @@ func controlSelfTest() -> Bool {
     check(swallowedAll && sc.droppedSpikes == 5, "spike guard drops the 5 warp spikes (\(sc.droppedSpikes)), still swallows them")
     check(fwd.0 == wantX && fwd.1 == wantY, "spike guard forwards all real motion incl. 91 pt and post-spike moves (sum \(fwd) vs \(wantX),\(wantY))")
     // After an injected jump (>150 pt), a mid-size spike (191,-125 in the user's trace) is also dropped; small moves pass.
-    sc.noteInjectedJump(600)
+    sc.noteInjectedMove(from: CGPoint(x: 100, y: 100), to: CGPoint(x: 700, y: 100))
     check(!smove(191, -125) || sc.droppedSpikes == 6, "post-jump limit drops a 228 pt delta")
-    sc.noteInjectedJump(600)
+    sc.noteInjectedMove(from: CGPoint(x: 700, y: 100), to: CGPoint(x: 100, y: 100))
     let before = sc.droppedSpikes
     _ = smove(20, 10)
     check(sc.droppedSpikes == before, "post-jump limit keeps a normal 22 pt move")
-    sc.noteInjectedJump(40) // hover-sized injected move: no extra strictness
+    sc.noteInjectedMove(from: CGPoint(x: 100, y: 100), to: CGPoint(x: 140, y: 100)) // hover-sized injected move: no extra strictness
     _ = smove(150, 0)
     check(sc.droppedSpikes == before, "small injected moves (hover) don't arm the post-jump limit (150 pt flick kept)")
+
+    // --warp-compensate: a physical delta right after injected warps W is (real + W); W is subtracted, so the
+    // forwarded motion is exactly the real motion, including sub-threshold (95-135 pt) contamination.
+    let wc = ControlMode()
+    wc.autoControl = false
+    wc.warpCompensate = true
+    var wcSent: [[String: Any]] = []
+    wc.clientConnected { t, p in if t == Msg.pointer { wcSent.append((try? JSONSerialization.jsonObject(with: p)) as? [String: Any] ?? [:]) } }
+    for d in [true, false] { let e = CGEvent(keyboardEventSource: nil, virtualKey: 46, keyDown: d)!; e.flags = [.maskControl, .maskAlternate, .maskCommand]; _ = wc.handle(d ? .keyDown : .keyUp, e) }
+    var wclock = 200.0
+    wc.now = { wclock }
+    func wmove(_ dx: Double, _ dy: Double) {
+        wclock += 0.01
+        let e = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: .zero, mouseButton: .left)!
+        e.setDoubleValueField(.mouseEventDeltaX, value: dx)
+        e.setDoubleValueField(.mouseEventDeltaY, value: dy)
+        _ = wc.handle(.mouseMoved, e)
+    }
+    var pos = CGPoint(x: 500, y: 500)
+    for i in 0..<12 {
+        let w = CGPoint(x: [110.0, -95, 130, 4][i % 4], y: [-20.0, 60, -100, 2][i % 4]) // hover warps, incl. sub-threshold
+        wc.noteInjectedMove(from: pos, to: CGPoint(x: pos.x + w.x, y: pos.y + w.y))
+        pos = CGPoint(x: pos.x + w.x, y: pos.y + w.y)
+        wmove(5 + w.x, -2 + w.y) // contaminated physical delta
+        wmove(5, -2) // clean one
+    }
+    let wsum = wcSent.reduce((0.0, 0.0)) { ($0.0 + ((($1["dx"] as? NSNumber)?.doubleValue) ?? 0), $0.1 + ((($1["dy"] as? NSNumber)?.doubleValue) ?? 0)) }
+    check(wsum.0 == 120 && wsum.1 == -48 && wc.droppedSpikes == 0, "warp compensation forwards exactly the real motion (\(wsum) vs 120,-48), no drops")
 
     // Auto control mode: ON when a headset connects, OFF on disconnect; manual OFF sticks until the next connect.
     var autoApplied: [Bool] = [], autoSent: [String] = []
@@ -754,6 +810,31 @@ func controlSelfTest() -> Bool {
     check(wasOn && !rc.isOn && hooked.map { "\($0.0)\($0.1 ? "d" : "u")\($0.2 ? "+" : "-")" } == ["49d+", "49u-"],
           "space keyUp reaches keyHook after control mode turned off (on=false)")
     rc.keyHook = nil
+
+    // v7: launcher hotkeys (Raycast ⌘+char, ⌥Space, ⌘Space, ...) are never swallowed, in or out of control mode,
+    // even with the real push-to-talk hook installed. Only exact ⌃⌥⌘ (+⇧) combos are ours.
+    for on in [false, true] {
+        let lc = ControlMode()
+        lc.autoControl = on
+        lc.clientConnected { _, _ in }
+        lc.keyHook = PushToTalk().hook
+        var leaked: [String] = []
+        let combos: [CGEventFlags] = [[.maskCommand], [.maskCommand, .maskShift], [.maskAlternate], [.maskCommand, .maskAlternate],
+                                      [.maskControl], [.maskCommand, .maskControl], [.maskControl, .maskAlternate],
+                                      [.maskAlternate, .maskShift], [.maskCommand, .maskAlternate, .maskShift]]
+        for code in CGKeyCode(0)...CGKeyCode(50) {
+            for f in combos {
+                for d in [true, false] {
+                    let e = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: d)!
+                    e.flags = f
+                    if lc.handle(d ? .keyDown : .keyUp, e) { leaked.append("\(code)/\(f.rawValue)\(d ? "d" : "u")") }
+                }
+            }
+        }
+        check(lc.isOn == on && leaked.isEmpty, "⌘/⌥/⌃+char launcher hotkeys pass through (control \(on ? "on" : "off"), PTT hook on): \(leaked.prefix(5))")
+    }
+    let ow = OverlayWatcher()
+    check(ow.isOverlayApp("Raycast") && ow.isOverlayApp("spotlight") && !ow.isOverlayApp("Ghostty"), "overlay apps: \(ow.apps.sorted())")
 
     // CURSOR encoding: payload header + PNG round trip for the I-beam.
     if let ci = CursorImage(.iBeam), let back = NSBitmapImageRep(data: ci.payload.dropFirst(8)) {

@@ -6,8 +6,8 @@ Swipes are POINTER bursts at ~120 Hz with a 150 ms finger-lift gap after each:
   normal 1200 pt/s for 0.4 s (480 pt)
   flick  3000 pt/s for 0.25 s (750 pt)
 The simulated user aims at the target's center and lifts the finger as soon as the cursor is on the target
-(predicted per message with the app's gain + acceleration model, TRAVEL_ACCEL=0 for older builds). After each swipe the
-app's state is read; the path is done when the cursor is on the target. Pass: ≤ 2 normal swipes, ≤ 1 flick.
+(predicted per message with the app's v7 model: planar native gain on panels, 0.04°/0.03° per pt in space). After each swipe the
+app's state is read; the path is done when the cursor is on the target. Flagged: > 3 normal swipes.
 
 Layout D mirrors the user's device layout (12:43): picker θ -1.301; A θ -0.671 1289 wide at r≈1360;
 B θ +0.245 same; C θ -0.104 r≈2080 28° below eye level.
@@ -21,45 +21,36 @@ from _common import arrange, check, finish, lab, release_capture, setup, window_
 
 QUICK = "--quick" in sys.argv
 PROFILES = {"slow": (300.0, 0.5), "normal": (1200.0, 0.4), "flick": (3000.0, 0.25)}
-LIMIT = {"slow": 4, "normal": 2, "flick": 1}
+# No headset acceleration since v7: report raw swipes; flag > 3 normal swipes (team-lead), slow/flick lenient.
+LIMIT = {"slow": 6, "normal": 3, "flick": 2}
 MAX_SWIPES = 10
 HZ = 120.0
 ROWS = []  # (section, path, kind, swipes, seconds, ok, note)
 
 
-ACCEL = os.environ.get("TRAVEL_ACCEL", "1") != "0"  # model the app's pointer acceleration (build ≥ 2026-10-07)
-
-
-def accel_factor(speed):
-    """Desk Accel: 1× up to 400 pt/s, linear to 3.5× at 2500 pt/s, flat beyond."""
-    if not ACCEL or speed <= 400:
-        return 1.0
-    return 1.0 + 2.5 * min(1.0, (speed - 400) / 2100)
-
-
 def zone_at(panels, theta, t):
-    """(id, 'CONTENT'|'OTHER') of the nearest panel under (theta, t) using Desk's plane model, or (None, None)."""
-    best = (None, None, 1e9)
+    """Id of the nearest panel whose planar region (content + corner handles, down to the bar) is under
+    (theta, t), using Desk's plane model; None in space."""
+    best, best_r = None, 1e9
     for pid, p in panels.items():
         d = wrap(theta - p["theta"])
         if math.cos(d) < 0.3:
             continue
         u, v = p["r"] * math.tan(d), p["r"] * t - p["y"]
-        if abs(u) <= p["w"] / 2 and abs(v) <= p["h"] / 2 and p["r"] < best[2]:
-            best = (pid, "CONTENT" if pid else "OTHER", p["r"])
-    return best[0], best[1]
+        if abs(u) <= p["w"] / 2 + 28 and lab.bar_v(p) - 17 <= v <= p["h"] / 2 + 28 and p["r"] < best_r:
+            best, best_r = pid, p["r"]
+    return best
 
 
-def predicted_gain(panels, theta, t, speed):
-    """dp per Mac point the app applies here at this speed (the user 'sees' this; we predict it to stop on time)."""
-    pid, zone = zone_at(panels, theta, t)
-    f = accel_factor(speed)
-    if pid is None:
-        return max(1.5, f) if ACCEL else 1.0
-    if zone == "CONTENT":
-        native = panels[pid]["w"] / lab.WINDOW_PTS[pid] if pid in lab.WINDOW_PTS else 0.8
-        return native if f == 1.0 else f
-    return f
+def step_model(panels, theta, t, dx, dy):
+    """v7 pointer model (Desk.kt): planar at native gain on a panel, angular in space. Detents ignored."""
+    pid = zone_at(panels, theta, t)
+    if pid is not None:
+        p = panels[pid]
+        k = p["w"] / lab.WINDOW_PTS[pid] if pid in lab.WINDOW_PTS else 1.0
+        return wrap(theta + dx * k / p["r"]), t - dy * k / p["r"]
+    e = math.atan(t) - math.radians(lab.ELEV_DEG_PER_PT) * dy
+    return wrap(theta + math.radians(lab.YAW_DEG_PER_PT) * dx), math.tan(max(-1.047, min(1.047, e)))
 
 
 def swipe(ux, uy, kind, length=None, buttons=None, stop=None, st=None):
@@ -75,9 +66,7 @@ def swipe(ux, uy, kind, length=None, buttons=None, stop=None, st=None):
     for i in range(n):
         lab.pointer(ux * step, uy * step, buttons)
         if st is not None:
-            r = lab._cursor_r(st)
-            g = predicted_gain(st["panels"], th, t, speed)
-            th, t = wrap(th + ux * step * g / r), t - uy * step * g / r
+            th, t = step_model(st["panels"], th, t, ux * step, uy * step)
             if stop and stop(th, t):
                 break
         nxt = t0 + (i + 1) / HZ
@@ -96,17 +85,16 @@ def on(st, pid, zones=("CONTENT", "BAR", "CORNER")):
 
 
 def aim(st, theta, t, allow_wrap=False):
-    """Mac-point vector from the cursor to (theta, t), at the cursor's current radius (1 dp/pt)."""
-    c = st["cursor"]
-    r = lab._cursor_r(st)
-    dth = wrap(theta - c["theta"]) if allow_wrap else theta - c["theta"]
-    return dth * r, -(t - c["t"]) * r
+    """Mac-point vector from the cursor toward (theta, t) under the v7 model (direction matters: yaw and
+    elevation have different rates)."""
+    return lab._pts_to(st, theta, t)
 
 
-def travel(st, target, kind, section, label, allow_wrap=False, start=None):
-    """Swipe from the current cursor position to [target]'s center. Returns (state, swipes)."""
+def travel(st, target, kind, section, label, allow_wrap=False, u_frac=0.0):
+    """Swipe from the current cursor position to [target] (its center, or u_frac × half-width right of it, e.g.
+    the visible part of a partly covered panel). Returns (state, swipes)."""
     p = st["panels"][target]
-    goal = (p["theta"], p["y"] / p["r"])
+    goal = (p["theta"] + math.atan(u_frac * p["w"] / 2 / p["r"]), p["y"] / p["r"])
     t_spent, swipes, stalls = 0.0, 0, 0
     while swipes < MAX_SWIPES:
         if on(st, target):
@@ -119,9 +107,9 @@ def travel(st, target, kind, section, label, allow_wrap=False, start=None):
         tgt = st["panels"][target]
 
         def reached(th, t, tgt=tgt):
-            u = tgt["r"] * math.tan(wrap(th - tgt["theta"]))
+            u = tgt["r"] * math.tan(wrap(th - tgt["theta"])) - u_frac * tgt["w"] / 2
             v = tgt["r"] * t - tgt["y"]
-            return abs(u) <= 0.4 * tgt["w"] and abs(v) <= 0.4 * tgt["h"]
+            return abs(u) <= 0.4 * tgt["w"] * (1 - abs(u_frac)) + 1 and abs(v) <= 0.4 * tgt["h"]
         # The user looks at the cursor and lifts when it's on the target (predicted with the app's gain model).
         t_spent += swipe(dx / dist, dy / dist, kind, stop=reached, st=st)
         swipes += 1
@@ -170,6 +158,75 @@ for kind in kinds:
                 continue
             st = park(st, src)
             st, _ = travel(st, dst, kind, "D", f"{names[src]} -> {names[dst]}")
+
+# ---------------------------------------------------------------- replay of the user's real gestures (local file)
+GESTURES = os.environ.get("TRAVEL_GESTURES",
+                          "/private/tmp/claude-501/-Users-andrey/d00ade63-1868-4af1-9070-2d4b6a936801/scratchpad/user_gestures.json")
+if os.path.exists(GESTURES):
+    import json
+    import re
+    data = json.load(open(GESTURES))
+    gestures = data["gestures"]
+    # Rebuild layout D around the picker, cursor on A, head looking ahead.
+    st = lab.state()
+    st = park(st, A)
+    lab.keepalive(False)
+    # 1) The 9 spikes, each alone after a pause, from a known spot: the cursor must not jump > 10°.
+    spikes = [e for g in gestures for e in g["events"] if math.hypot(e[1], e[2]) > 200]
+    worst = 0.0
+    for e in spikes:
+        st0 = lab.state()
+        time.sleep(0.3)
+        lab.pointer(e[1], e[2], 0, 0, 0)
+        time.sleep(0.3)
+        st1 = lab.state()
+        d = math.degrees(math.hypot(wrap(st1["cursor"]["theta"] - st0["cursor"]["theta"]),
+                                    math.atan(st1["cursor"]["t"]) - math.atan(st0["cursor"]["t"])))
+        worst = max(worst, d)
+        st = park(st1, A) if d > 1 else st1
+    check(f"replay: none of the {len(spikes)} recorded spike events moves the cursor > 10°", worst <= 10.0,
+          f"worst jump {worst:.1f}° for spikes {[(round(e[1]), round(e[2])) for e in spikes]}")
+    # 2) The whole recording with original in-gesture timing (gaps between gestures capped at 1.5 s).
+    t0 = time.time()
+    prev_end = None
+    for g in gestures:
+        gap = 0.15 if prev_end is None else min(1.5, max(0.15, (g["start_us"] - prev_end) / 1e6))
+        time.sleep(gap)
+        g0 = time.time()
+        for ev in g["events"]:
+            at = g0 + ev[0] / 1000.0
+            time.sleep(max(0.0, at - time.time()))
+            lab.pointer(ev[1], ev[2], int(ev[3]), ev[4], ev[5])
+        if lab._buttons:
+            lab.pointer(0, 0, 0)
+        prev_end = g["start_us"] + g["duration_ms"] * 1000
+    lab.keepalive(True)
+    time.sleep(1.2)
+    samples = [lab.parse_pointer(l) for l in lab.logs(t0, r"pointer: ")]
+    elev = [math.degrees(math.atan(sm["cursor"]["t"])) for sm in samples if sm.get("cursor")]
+    pinned = [e for e in elev if abs(e) >= 59.0]
+    visited = []
+    for sm in samples:
+        h = sm.get("hover")
+        if h and (not visited or visited[-1] != h["id"]):
+            visited.append(h["id"])
+    tl = lab.logs(t0, r"travel: ")
+    jumps = []
+    for l in tl:
+        m = re.search(r"\(Δ([-+]?[\d.]+) rad\) in (\d+) ms", l)
+        if m:
+            jumps.append((float(m[1]), int(m[2])))
+    print(f"      replay: {len(gestures)} gestures, {sum(len(g['events']) for g in gestures)} events, {time.time() - t0:.0f} s; "
+          f"{len(samples)} state samples; elevation range {min(elev, default=0):.1f}..{max(elev, default=0):.1f}°; "
+          f"panels visited {[names.get(i, i) for i in visited]}; {len(tl)} travel log lines")
+    check("replay: cursor never pins at the vertical limit (|elevation| < 59°)", not pinned,
+          f"{len(pinned)} of {len(elev)} samples at the limit: {pinned[:5]}")
+    check("replay: the recorded gestures traverse panels (≥ 2 different windows hovered)",
+          len({i for i in visited if i}) >= 2, f"visited {[names.get(i, i) for i in visited]}")
+    lab.head(-20, 0)
+    lab.shot("after_replay")
+else:
+    print(f"      replay skipped: {GESTURES} not found")
 
 # ---------------------------------------------------------------- gaps: crossing A -> B at eye level in small steps
 st = park(st, A)
@@ -242,7 +299,7 @@ st = lab.cursor_to(pa["theta"] + 0.05, 0.0, st)
 check("overlap: the nearer panel wins the hover", st["hover"] and st["hover"]["id"] == (A if pa["r"] < pb["r"] else B),
       f"A r {pa['r']:.0f} B r {pb['r']:.0f}; hover {st['hover']}")
 st = park(st, 0)
-st, n = travel(st, B, "normal", "edge", "picker -> B behind A")
+st, n = travel(st, B, "normal", "edge", "picker -> B behind A (its visible right part)", u_frac=0.7)
 
 # Very small (glance) and very large (editor) panels.
 st = arrange(st, C, preset="glance")

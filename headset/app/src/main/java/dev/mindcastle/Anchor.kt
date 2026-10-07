@@ -52,3 +52,61 @@ data class Anchor(val pos: Vec3 = Vec3(0f, 0f, 0f), val yawDeg: Float = 0f, val 
     /** Local layout point -> Subspace dp. */
     fun toWorld(v: Vec3): Vec3 = pos + rotate(v)
 }
+
+/**
+ * A thin strip from [from] to [to] (Subspace dp) as a panel pose: its center, its length, and the
+ * rotation (x, y, z, w) taking the panel's +y onto the strip and its face toward [eye].
+ */
+fun strip(from: Vec3, to: Vec3, eye: Vec3): Triple<Vec3, Float, FloatArray> {
+    val d = to - from
+    val len = kotlin.math.sqrt(d dot d)
+    val mid = from + d * 0.5f
+    if (len < 1e-3f) return Triple(mid, 0f, floatArrayOf(0f, 0f, 0f, 1f))
+    val y = d * (1f / len)
+    fun cross(a: Vec3, b: Vec3) = Vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
+    fun norm(v: Vec3) = v * (1f / kotlin.math.sqrt(v dot v))
+    var toEye = eye - mid
+    if (abs(norm(toEye) dot y) > 0.999f) toEye = Vec3(0f, 0f, 1f)
+    val x = norm(cross(y, toEye))
+    val z = cross(x, y)
+    // Rotation matrix with columns x, y, z -> quaternion.
+    val m00 = x.x; val m11 = y.y; val m22 = z.z
+    val tr = m00 + m11 + m22
+    val q = if (tr > 0f) {
+        val s = kotlin.math.sqrt(tr + 1f) * 2f
+        floatArrayOf((y.z - z.y) / s, (z.x - x.z) / s, (x.y - y.x) / s, 0.25f * s)
+    } else if (m00 > m11 && m00 > m22) {
+        val s = kotlin.math.sqrt(1f + m00 - m11 - m22) * 2f
+        floatArrayOf(0.25f * s, (y.x + x.y) / s, (z.x + x.z) / s, (y.z - z.y) / s)
+    } else if (m11 > m22) {
+        val s = kotlin.math.sqrt(1f + m11 - m00 - m22) * 2f
+        floatArrayOf((y.x + x.y) / s, 0.25f * s, (z.y + y.z) / s, (z.x - x.z) / s)
+    } else {
+        val s = kotlin.math.sqrt(1f + m22 - m00 - m11) * 2f
+        floatArrayOf((z.x + x.z) / s, (z.y + y.z) / s, 0.25f * s, (x.y - y.x) / s)
+    }
+    return Triple(mid, len, q)
+}
+
+/** Where to draw the "it's over there" arrow: [pos] in front of the head, facing it, glyph at [screenAngle]. */
+data class OffViewArrow(val pos: Vec3, val yawDeg: Float, val pitchDeg: Float, val screenAngle: Float)
+
+/**
+ * If [target] is more than [fovHalfDeg] off the head's gaze, an arrow 1 m ahead, nudged 0.3 m toward the
+ * target, whose glyph points at it (screen angle, radians: 0 = right, π/2 = up). Null when it's in view.
+ */
+fun offViewArrow(head: Ray, target: Vec3, dpPerMeter: Float, fovHalfDeg: Float = 35f): OffViewArrow? {
+    fun cross(a: Vec3, b: Vec3) = Vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
+    fun norm(v: Vec3) = v * (1f / kotlin.math.sqrt(v dot v))
+    val f = norm(head.dir)
+    val v = norm(target - head.origin)
+    if ((v dot f) >= kotlin.math.cos(Math.toRadians(fovHalfDeg.toDouble())).toFloat()) return null
+    val worldUp = if (abs(f.y) > 0.95f) Vec3(0f, 0f, -1f) else Vec3(0f, 1f, 0f)
+    val right = norm(cross(f, worldUp)); val up = cross(right, f)
+    val ang = atan2(v dot up, v dot right)
+    val pos = head.origin + f * dpPerMeter + (right * kotlin.math.cos(ang) + up * kotlin.math.sin(ang)) * (0.3f * dpPerMeter)
+    val toHead = head.origin - pos
+    val yaw = Math.toDegrees(atan2(-toHead.x, toHead.z).toDouble()).toFloat()
+    val pitch = Math.toDegrees(atan2(toHead.y, kotlin.math.hypot(toHead.x, toHead.z)).toDouble()).toFloat()
+    return OffViewArrow(pos, yaw, -pitch, ang)
+}

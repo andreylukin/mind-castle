@@ -49,6 +49,23 @@ final class Trace {
         timer = t
     }
 
+    /// `--trace-input`: raw physical moves and injected warps, to fit how warps leak into physical deltas.
+    var traceInput = false
+
+    /// One raw physical mouse/trackpad move as seen by the control tap (before filtering).
+    func rawMove(dx: Double, dy: Double, dropped: Bool) {
+        guard traceInput else { return }
+        let t = hostMicros()
+        q.async { [self] in write(["type": "mv", "t": t, "dx": dx, "dy": dy, "dropped": dropped]) }
+    }
+
+    /// One injected cursor move (MOUSE/CLICK warp of the hidden cursor), in global points.
+    func warp(from: CGPoint, to: CGPoint) {
+        guard traceInput else { return }
+        let t = hostMicros()
+        q.async { [self] in write(["type": "warp", "t": t, "x0": from.x, "y0": from.y, "x1": to.x, "y1": to.y]) }
+    }
+
     /// One POINTER as sent in control mode (trackpad deltas only, no screen content), for gesture replay tests.
     func pointer(dx: Double, dy: Double, buttons: Int, sx: Double, sy: Double) {
         let t = hostMicros()

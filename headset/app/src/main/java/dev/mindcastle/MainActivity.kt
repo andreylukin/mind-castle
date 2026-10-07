@@ -5,6 +5,7 @@ import android.os.Bundle
 import androidx.compose.runtime.DisposableEffect
 import android.util.Log
 import android.os.Handler
+import android.view.Choreographer
 import android.os.Looper
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -43,6 +44,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.animation.core.animateFloatAsState
+import kotlin.math.abs
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -52,6 +56,8 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Row
 import androidx.compose.ui.text.style.TextOverflow
 import kotlin.math.cos
+import kotlin.math.atan2
+import kotlin.math.min
 import kotlin.math.sin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalDensity
@@ -106,6 +112,7 @@ class MainActivity : ComponentActivity() {
     private val client = CastleClient()
     private val main = Handler(Looper.getMainLooper())
     private val desk: Desk by lazy {
+        Accel.DETENT_DP = 0f // any detent felt sticky on device
         Desk { tick.value++ }.apply {
             lookToJump = false
             acceleration = true
@@ -118,6 +125,12 @@ class MainActivity : ComponentActivity() {
     /** Bumped on every resume: taking the headset off drops the app out of full space. */
     private val resumes = MutableStateFlow(0)
     private var pointerLogAt = 0L
+
+    /** The `pointer:` state line (lab.state() parses it): cursor, mode, hover, buttons, capture, center, panels. */
+    private fun logPointer(now: Long) {
+        Log.i("Castle", "pointer: $pointerCount msgs, cursor=(θ %.3f, t %.3f) mode=${if (desk.onPanel) "2D" else "3D"} hover=${desk.hover} buttons=$pointerButtons captured=${desk.captured} center=${desk.center} panels=${desk.panels.map { (id, q) -> "$id@(θ %.3f y %.0f r %.0f %.0fx%.0f)".format(q.theta, q.y, q.r, q.w, q.h) }}".format(desk.cursorTheta, desk.cursorT))
+        pointerCount = 0; pointerLogAt = now
+    }
     private var pointerButtons = 0
     /** Head ray in Subspace dp, for look-to-jump; set once the session and origin entity exist. */
     var gaze: (() -> Ray?)? = null
@@ -126,6 +139,13 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         desk.onLayoutChange = { main.removeCallbacks(saveLayout); main.postDelayed(saveLayout, 500) }
         client.onCommand = { json -> main.post { command(json) } }
+        client.onFocusChanged = { f ->
+            main.post {
+                val before = desk.shown
+                Log.i("Castle", desk.focusChanged(f.id, System.currentTimeMillis()) + " ('${f.title.take(40)}')")
+                if (desk.shown != before) client.subscribe(desk.shown)
+            }
+        }
         desk.onCapture = { id, why -> Log.i("Castle", if (id != null) "capture: start window $id ($why)" else "capture: end ($why)") }
         client.onPointer = { p ->
             main.post {
@@ -133,16 +153,23 @@ class MainActivity : ComponentActivity() {
                 val capBefore = desk.captured
                 desk.pointer(p, now, gaze).forEach(::perform)
                 pointerCount++
-                // Every 1 s, and at once on button/capture changes (the emulator lab parses this line).
+                // At once on button/capture changes; the 1 s heartbeat is in the frame loop.
                 val changed = p.buttons != pointerButtons || desk.captured != capBefore
                 pointerButtons = p.buttons
-                if (changed || now - pointerLogAt > 1000) {
-                    Log.i("Castle", "pointer: $pointerCount msgs, cursor=(θ %.3f, t %.3f) hover=${desk.hover} buttons=${p.buttons} captured=${desk.captured} center=${desk.center} panels=${desk.panels.map { (id, q) -> "$id@(θ %.3f y %.0f r %.0f %.0fx%.0f)".format(q.theta, q.y, q.r, q.w, q.h) }}".format(desk.cursorTheta, desk.cursorT))
-                    pointerCount = 0; pointerLogAt = now
-                }
+                if (changed) logPointer(now)
             }
         }
         client.start()
+        // Device pointer model: motion collected from POINTER messages is applied once per display frame.
+        Choreographer.getInstance().postFrameCallback(object : Choreographer.FrameCallback {
+            override fun doFrame(frameTimeNanos: Long) {
+                val now = System.currentTimeMillis()
+                desk.frame(now).forEach(::perform)
+                // Every 1 s while control mode is on, POINTER traffic or not (the emulator lab parses this line).
+                if (desk.control && now - pointerLogAt > 1000) logPointer(now)
+                Choreographer.getInstance().postFrameCallback(this)
+            }
+        })
         window.decorView.setBackgroundColor(android.graphics.Color.BLACK)
         setContent { Castle(client, desk, tick, resumes, recenterRequests, foreground, roomHost, ::switchHost, ::toggle) { gaze = it } }
     }
@@ -254,6 +281,7 @@ fun Castle(
     val macCursor by client.cursor.collectAsState()
     val arrow by client.arrow.collectAsState()
     val voice by client.voice.collectAsState()
+    val overlay by client.overlay.collectAsState()
     // Done/error lines linger, then the header goes back to the connection status.
     LaunchedEffect(voice) {
         val v = voice ?: return@LaunchedEffect
@@ -318,6 +346,11 @@ fun Castle(
     Subspace {
         // Desk is plain Kotlin; reading tick here makes the subspace recompose on every Desk change.
         tick.collectAsState().value
+        // The edge cue ends by itself too.
+        LaunchedEffect(desk.edgeCueUntilMs) {
+            val left = desk.edgeCueUntilMs - System.currentTimeMillis()
+            if (left > 0) { delay(left + 50); tick.value++ }
+        }
         // The focus flash ends by itself: redraw once it's over (keyed here, where Desk changes recompose).
         LaunchedEffect(desk.flashUntilMs) {
             val left = desk.flashUntilMs - System.currentTimeMillis()
@@ -363,32 +396,98 @@ fun Castle(
                     windows.firstOrNull { it.id == id }?.let { w -> WindowPanel(client, w, p ?: last, chrome, mod, desk::noteClicked) }
                 }
             }
-            // One cursor panel, always drawn in control mode: the Mac's own cursor at the window's scale
-            // (hotspot on the pointer), or a white dot until the Mac has sent a cursor image; 4 dp in front of
-            // whatever it's on. In empty space: the dot plus a chevron pointing at the nearest panel.
+            // The cursor, always drawn in control mode, in one panel centered on the pointer:
+            //  - on a panel (2D): the Mac's own cursor lying flat on it at the window's scale, hotspot on the pointer;
+            //  - in space (3D): a glowing reticle at the default distance, with a chevron toward the nearest panel,
+            //    and a faint ray from just below the head (a second, persistent panel).
+            // The two morph into each other over ~120 ms when the cursor crosses a panel edge.
             val img = if (desk.overContent) macCursor else arrow
             val (fp, fu, fv) = desk.cursorFrame()
-            val toward = if (control) desk.nearestPanelDirection() else null
-            val cursorAt = when {
-                !control -> parked(desk).size(20.dp)
-                toward != null -> placed(desk.planePoint(fp, fu, fv, lift = 4f), fp).size(EMPTY_CURSOR.dp)
-                img != null -> img.header.placement(img.bitmap.width, img.bitmap.height, desk.cursorDpPerPoint()).let { pl ->
-                    placed(desk.planePoint(fp, fu + pl.du, fv + pl.dv, lift = 4f), fp).width(pl.w.dp).height(pl.h.dp)
-                }
-                else -> placed(desk.planePoint(fp, fu, fv, lift = 4f), fp).size(20.dp)
-            }
+            val onPanel = desk.onPanel
+            val panelness by animateFloatAsState(if (onPanel) 1f else 0f, tween(120), label = "cursor-morph")
+            val toward = if (control && !onPanel) desk.nearestPanelDirection() else null
+            val edgeCue = control && System.currentTimeMillis() < desk.edgeCueUntilMs
+            val pl = img?.header?.placement(img.bitmap.width, img.bitmap.height, desk.cursorDpPerPoint())
+            val half = maxOf(36f, pl?.let { maxOf(abs(it.du) + it.w / 2, abs(it.dv) + it.h / 2) } ?: 0f)
+            val pointer = desk.planePoint(fp, fu, fv, lift = 4f)
+            val cursorAt = if (!control) parked(desk).size(20.dp) else placed(pointer, fp).size((2 * half).dp)
             SpatialPanel(cursorAt.pointerHoverIcon(SpatialPointerIcon.NONE), shape = SpatialRoundedCornerShape(CornerSize(0.dp))) {
-                when {
-                    !control -> {}
-                    toward != null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Box(Modifier.size(20.dp).background(Color.White, CircleShape).border(2.dp, Color(0xFF202020), CircleShape))
-                        val d = 22f // chevron distance from the dot, dp
-                        Text("➤", color = Color(0xFF7FD4FF), fontSize = 16.sp, modifier = Modifier
-                            .offset((cos(toward) * d).dp, (-sin(toward) * d).dp)
+                if (control) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    // 3D reticle: glowing sphere-ish dot (+ chevron, + edge-cue ring).
+                    Box(Modifier.graphicsLayer { alpha = 1 - panelness; scaleX = 1 - 0.5f * panelness; scaleY = scaleX },
+                        contentAlignment = Alignment.Center) {
+                        Box(Modifier.size(34.dp).background(Brush.radialGradient(listOf(Color(0x997FD4FF), Color(0x007FD4FF))), CircleShape))
+                        Box(Modifier.size(14.dp).background(Color.White, CircleShape).border(2.dp, Color(0xFF7FD4FF), CircleShape))
+                        if (edgeCue) Box(Modifier.size(44.dp).border(3.dp, Color(0xCC7FD4FF), CircleShape))
+                        if (toward != null) Text("➤", color = Color(0xFF7FD4FF), fontSize = 16.sp, modifier = Modifier
+                            .offset((cos(toward) * 24f).dp, (-sin(toward) * 24f).dp)
                             .graphicsLayer { rotationZ = -Math.toDegrees(toward.toDouble()).toFloat() })
                     }
-                    img != null -> Image(img.bitmap.asImageBitmap(), contentDescription = null, modifier = Modifier.fillMaxSize())
-                    else -> Box(Modifier.fillMaxSize().background(Color.White, CircleShape).border(2.dp, Color(0xFF202020), CircleShape))
+                    // 2D: the flat Mac cursor (or a dot before the Mac sent one), hotspot on the pointer.
+                    Box(Modifier.graphicsLayer { alpha = panelness; scaleX = 0.6f + 0.4f * panelness; scaleY = scaleX }) {
+                        if (img != null && pl != null) Image(img.bitmap.asImageBitmap(), contentDescription = null,
+                            modifier = Modifier.offset(pl.du.dp, (-pl.dv).dp).size(pl.w.dp, pl.h.dp))
+                        else Box(Modifier.size(20.dp).background(Color.White, CircleShape).border(2.dp, Color(0xFF202020), CircleShape))
+                    }
+                }
+            }
+            // The ray, in space only: a short tail — the last 25 cm before the reticle along the line from just
+            // below the head — fading out toward the user. Never drawn through the laptop cutout.
+            val eye = desk.center
+            val below = eye + Vec3(0f, -0.25f * desk.dpPerMeter, 0f)
+            val rayDir = (pointer - below).let { it * (1f / kotlin.math.sqrt(it dot it)) }
+            val tailStart = pointer - rayDir * (Rays.TAIL_M * desk.dpPerMeter)
+            val env = desk.env
+            val throughCutout = listOf(tailStart, pointer).any { Shell.inCutout(it - eye, desk.forward, env.cutHalfYaw, env.cutTop) }
+            val rayOn = control && !onPanel && !throughCutout
+            val (mid, len, q) = strip(tailStart, pointer, eye)
+            val rayAt = if (rayOn && len > 1f) SubspaceModifier.offset(mid.x.dp, mid.y.dp, mid.z.dp)
+                .rotate(Quaternion(q[0], q[1], q[2], q[3])).width(2.dp).height(len.dp)
+            else parked(desk).size(2.dp)
+            SpatialPanel(rayAt.pointerHoverIcon(SpatialPointerIcon.NONE), shape = SpatialRoundedCornerShape(CornerSize(0.dp))) {
+                if (rayOn) Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0x997FD4FF), Color(0x007FD4FF)))))
+            }
+
+            // v7 OVERLAY (Raycast & co): one persistent slot, re-bound to whichever overlay is up; it appears
+            // where the head points, ~0.9 m away and in front of every panel; parked when there's none.
+            val s0 = session; val o0 = origin.value
+            var overlayYaw by remember { mutableStateOf(0f) }
+            LaunchedEffect(overlay?.id) {
+                if (overlay != null && s0 != null && o0 != null)
+                    headRay(s0, o0, desk.dpPerMeter)?.let { overlayYaw = atan2(it.dir.x, -it.dir.z) }
+            }
+            val ov = overlay
+            val ovPanel = ov?.let {
+                val r = min(Overlays.DISTANCE_M * desk.dpPerMeter, (desk.panels.values.minOfOrNull { p -> p.r } ?: desk.defaultR) - 0.1f * desk.dpPerMeter)
+                    .coerceAtLeast(0.4f * desk.dpPerMeter)
+                val k = Desk.PANEL_SCALE * r / desk.defaultR // same angular size as a normal panel of that window
+                Panel(overlayYaw, 0f, r, it.w * k, it.h * k)
+            }
+            OverlayPanel(client, ov?.id, if (ovPanel != null) placed(desk.position(ovPanel), ovPanel).width(ovPanel.w.dp).height(ovPanel.h.dp)
+                else parked(desk).size(20.dp))
+
+            // v7 focus-follow: if the window the Mac just focused is out of view, an arrow toward it (≤ 3 s).
+            var offView by remember { mutableStateOf<OffViewArrow?>(null) }
+            LaunchedEffect(desk.focusTarget, desk.focusAtMs) {
+                offView = null
+                val id = desk.focusTarget ?: return@LaunchedEffect
+                val s = s0 ?: return@LaunchedEffect; val o = o0 ?: return@LaunchedEffect
+                val until = desk.focusAtMs + 3000
+                while (System.currentTimeMillis() < until) {
+                    val p = desk.panels[id] ?: break
+                    val head = headRay(s, o, desk.dpPerMeter) ?: break
+                    offView = offViewArrow(head, desk.position(p), desk.dpPerMeter)
+                    if (offView == null) break
+                    delay(100)
+                }
+                offView = null
+            }
+            val oa = offView
+            SpatialPanel((if (oa != null) placed(oa.pos, oa.yawDeg, oa.pitchDeg).size(64.dp) else parked(desk).size(20.dp))
+                .pointerHoverIcon(SpatialPointerIcon.NONE), shape = SpatialRoundedCornerShape(CornerSize(0.dp))) {
+                if (oa != null) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("➤", color = Color(0xFF7FD4FF), fontSize = 40.sp,
+                        modifier = Modifier.graphicsLayer { rotationZ = -Math.toDegrees(oa.screenAngle.toDouble()).toFloat() })
                 }
             }
         }
@@ -600,6 +699,45 @@ fun VoiceLine(v: Voice) {
     }
 }
 
+/** In-space cursor ray. */
+object Rays {
+    const val TAIL_M = 0.25f // only this much of the ray, just behind the reticle
+}
+
+/** v7 overlay tuning. */
+object Overlays {
+    const val DISTANCE_M = 0.9f
+}
+
+/**
+ * The single overlay slot: a SurfaceView that's handed to whichever overlay's decoder is current
+ * (none → parked, nothing bound). Created once, so overlays never cost a new input channel.
+ */
+@Composable
+fun OverlayPanel(client: CastleClient, id: Int?, modifier: SubspaceModifier) {
+    SpatialAndroidViewPanel(
+        factory = { ctx ->
+            SurfaceView(ctx).apply {
+                holder.addCallback(object : SurfaceHolder.Callback {
+                    override fun surfaceCreated(h: SurfaceHolder) { (tag as? Int)?.let { client.decoder(it).setSurface(h.surface) } }
+                    override fun surfaceChanged(h: SurfaceHolder, f: Int, width: Int, height: Int) {}
+                    override fun surfaceDestroyed(h: SurfaceHolder) { (tag as? Int)?.let { client.peekDecoder(it)?.setSurface(null) } }
+                })
+            }
+        },
+        modifier = modifier.pointerHoverIcon(SpatialPointerIcon.NONE),
+        shape = SpatialRoundedCornerShape(CornerSize(12.dp)),
+        update = { v ->
+            val old = v.tag as? Int
+            if (old != id) {
+                old?.let { client.peekDecoder(it)?.setSurface(null) }
+                v.tag = id
+                if (id != null && v.holder.surface?.isValid == true) client.decoder(id).setSurface(v.holder.surface)
+            }
+        },
+    )
+}
+
 @SuppressLint("ClickableViewAccessibility")
 @Composable
 fun WindowPanel(client: CastleClient, w: MacWindow, p: Panel, c: Chrome.State, modifier: SubspaceModifier, onTap: (Int) -> Unit) {
@@ -664,7 +802,6 @@ fun WindowPanel(client: CastleClient, w: MacWindow, p: Panel, c: Chrome.State, m
     )
 }
 
-private const val EMPTY_CURSOR = 72f // dp: dot + chevron toward the nearest panel, in empty space
 private val HOT = Color(0xFF7FD4FF)
 private val HANDLE = Color(0xAAFFFFFF)
 val Chrome.State.outlineColor get() = if (dragging) HOT else Color(0x55FFFFFF)

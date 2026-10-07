@@ -117,6 +117,7 @@ class Fake:
         self.control = False
         self.cursor = "arrow"
         self.subs = {}  # id -> frame index
+        self.overlays = set()  # overlay ids stream without SUBSCRIBE
         self.clips = {wid: clip(wid, w, h, c) for wid, _, w, h, c in WINDOWS}
 
     def send(self, t, wid, payload):
@@ -178,7 +179,9 @@ class Fake:
             ids = json.loads(p)["ids"]
             log(f"subscribe {ids}")
             with self.lock:
+                keep = {i: self.subs[i] for i in self.overlays if i in self.subs}
                 self.subs = {i: self.subs.get(i, -1) for i in ids}
+                self.subs.update(keep)
             for i in ids:
                 if i in self.clips:
                     self.restart(i)
@@ -260,6 +263,31 @@ class Fake:
                 return 'command needs "cmd": string'
             log("lab: COMMAND " + json.dumps(cmd, sort_keys=True))
             self.send(20, 0, json.dumps(cmd).encode())
+        elif t == "focus":  # v7 FOCUS_CHANGED (23): the Mac's frontmost window changed
+            w = next((w for w in WINDOWS if w[0] == obj.get("id")), None)
+            payload = {"id": obj.get("id"), "app": obj.get("app") or (w and "castle-testwin") or "?",
+                       "title": obj.get("title") or (w and w[1]) or "?"}
+            log("lab: FOCUS_CHANGED " + json.dumps(payload))
+            self.send(23, 0, json.dumps(payload).encode())
+        elif t == "overlay":  # v7 OVERLAY (24): a floating system overlay (Raycast, Spotlight...), streamed unasked
+            oid = int(obj.get("id", 9100))
+            vis = bool(obj.get("visible", True))
+            payload = {"id": oid, "app": obj.get("app", "Raycast"), "visible": vis}
+            if vis:
+                payload.update(w=int(obj.get("w", 1500)), h=int(obj.get("h", 900)))
+                if oid not in self.clips:
+                    self.clips[oid] = clip(oid, payload["w"], payload["h"], "orange")
+            log("lab: OVERLAY " + json.dumps(payload))
+            self.send(24, 0, json.dumps(payload).encode())
+            with self.lock:
+                if vis:
+                    self.subs[oid] = -1
+                    self.overlays.add(oid)
+                else:
+                    self.subs.pop(oid, None)
+                    self.overlays.discard(oid)
+            if vis:
+                self.restart(oid)
         elif t == "cursor":
             self.cursor = obj.get("name", "arrow")
             if self.control:

@@ -79,6 +79,13 @@ object Shell {
         return Mesh(pos.toFloatArray(), idx.toIntArray())
     }
 
+    /** Whether direction [dir] (from the user, layout frame) looks through the laptop cutout. */
+    fun inCutout(dir: Vec3, forward: Float, cutHalfYaw: Float, cutTop: Float): Boolean {
+        val yaw = Math.toDegrees(wrapAngle(kotlin.math.atan2(dir.x, -dir.z) - forward).toDouble())
+        val elev = Math.toDegrees(kotlin.math.atan2(dir.y, kotlin.math.hypot(dir.x, dir.z)).toDouble())
+        return kotlin.math.abs(yaw) < cutHalfYaw && elev < cutTop
+    }
+
     fun caps(dpPerMeter: Float): List<Cap> {
         val r = RADIUS_M * dpPerMeter
         val side = 2 * r * CAP_MARGIN

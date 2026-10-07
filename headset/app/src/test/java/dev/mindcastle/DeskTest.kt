@@ -512,8 +512,8 @@ class DeskTest {
         d.pointer(Pointer(dx = 30f)) // 48
         assertEquals("still captured, clamped", 7, d.captured)
         assertEquals(p.w / 2, d.uv(7).first, 0.01f)
-        val mv = d.pointer(Pointer(dx = 1f)).single() as Action.Mouse
-        assertEquals("move", mv.kind); assertEquals(1f, mv.x, 0f) // pinned to the edge
+        // Pinned to the edge: the window pointer doesn't move, so no hover MOUSE is sent.
+        assertTrue(d.pointer(Pointer(dx = 1f)).isEmpty())
         d.pointer(Pointer(dx = 20f)) // 48.8 + 16 > 60: leaves
         assertNull(d.captured)
         assertNull("parked just past the edge, in the gap", d.hover)

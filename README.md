@@ -60,6 +60,8 @@ In the headset, pick windows from the picker. They stream live as panels you can
 
 The *active panel* is the one the cursor is in, else the one you last clicked, else the one you're looking at. Without a headset connected, the panel hotkeys pass through to your apps (⌃⌥⌘M is always taken).
 
+**Follows your Mac:** switching windows on the Mac (Raycast window hotkeys, ⌘-Tab, a click) makes that window the active panel and moves the cursor onto it. Launchers (Raycast, Spotlight, Alfred) pop up as a floating panel in front of you while they're open. To add other launcher apps, list them in `~/.config/mind-castle/overlays.json`, e.g. `{"apps": ["Raycast", "Spotlight", "Alfred"]}`.
+
 **Voice:** in control mode, hold Space and speak (e.g. "put Slack on the left", "show the terminal"), then release. A quick tap still types a space. This needs Microphone permission and an OpenAI key.
 
 **Bail-out:** press ⌃⌥⌘M again, unplug the headset (control mode turns off automatically), or press Ctrl-C in the `castle` terminal. The screen and mouse are always restored.

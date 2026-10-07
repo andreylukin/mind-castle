@@ -77,6 +77,9 @@ class CastleClient(private val host: String = "127.0.0.1", private val port: Int
         Thread({ tick() }, "castle-tick").apply { isDaemon = true; start() }
     }
 
+    /** The decoder for [id] if one exists (never creates one — for unbinding surfaces). */
+    fun peekDecoder(id: Int): WindowDecoder? = decoders[id]
+
     fun decoder(id: Int): WindowDecoder = decoders.getOrPut(id) { WindowDecoder(id, { requestKeyframe(id) }, traces::add) }
 
     fun subscribe(ids: Collection<Int>) {
@@ -86,6 +89,11 @@ class CastleClient(private val host: String = "127.0.0.1", private val port: Int
     /** Re-sent after the first WINDOW_LIST of every connection, so a reconnect (or Mac streamer restart) resumes streams. */
     @Volatile private var lastSubscribe: List<Int> = emptyList()
     @Volatile private var resubscribe = false
+    /** Called on the network thread for each FOCUS_CHANGED (PROTOCOL v7). */
+    @Volatile var onFocusChanged: ((FocusChanged) -> Unit)? = null
+    /** The launcher overlay currently up (PROTOCOL v7 OVERLAY), or null. */
+    val overlay = MutableStateFlow<Overlay?>(null)
+
     /** Called on the network thread for each COMMAND (raw JSON). */
     @Volatile var onCommand: ((String) -> Unit)? = null
 
@@ -197,6 +205,12 @@ class CastleClient(private val host: String = "127.0.0.1", private val port: Int
             7 -> control.value = JSONObject(String(p)).optBoolean("control").also { Log.i(TAG, "control mode $it") }
             8 -> ByteBuffer.wrap(p).run { clock.add(long, long, recvUs) }
             20 -> onCommand?.invoke(String(p))
+            23 -> runCatching { FocusChanged.parse(String(p)) }.getOrNull()?.let { onFocusChanged?.invoke(it) }
+            24 -> runCatching { Overlay.parse(String(p)) }.getOrNull()?.let { o ->
+                Log.i(TAG, "overlay: ${o.app} ${o.id} ${if (o.visible) "visible ${o.w}x${o.h}" else "hidden"}")
+                overlay.value = o.takeIf { it.visible }
+                if (!o.visible) decoders.remove(o.id)?.release()
+            }
             21 -> voice.value = runCatching { Voice.parse(String(p)) }.getOrNull()?.also { Log.i(TAG, "voice: ${it.state} '${it.text.take(80)}'") }
             9 -> {
                 val h = CursorHeader.parse(p)

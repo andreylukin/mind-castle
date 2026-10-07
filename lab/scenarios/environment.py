@@ -64,8 +64,9 @@ mono = all(lumas[k] < lumas[k - 1] for k in range(5, 0, -1))
 check("each dim step lets more room through (monotonic)", mono, str({k: round(v, 1) for k, v in lumas.items()}))
 lin = [abs(lumas[k] / max(lumas[0], 1) - (1 - k / 5)) for k in range(6)]
 check("dim steps are roughly even (luma ∝ 1 - level/5, ±0.12)", max(lin) < 0.12, f"deviation {[round(d, 2) for d in lin]}")
+room_seams = set(seams(lab.Img(paths[0], 600)))  # lines in the room itself (planks, door frames) at dim 0
 for level in (4, 3, 2, 1):
-    sm = seams(lab.Img(paths[level], 600))
+    sm = [x for x in seams(lab.Img(paths[level], 600)) if not any(abs(x - r) <= 2 for r in room_seams)]
     check(f"dim {level}: no banding / double-alpha lines where shell pieces overlap", not sm,
           f"{len(sm)} seam columns at x≈{sm[:12]} (600 px) | {paths[level]}")
 env("dim", d=5)
@@ -92,7 +93,7 @@ def hole(path):
         return None
     f = lab.F600
     az = [math.degrees(math.atan2((x - img.w / 2) / f, math.cos(math.radians(PITCH)))) for x in (min(xs), max(xs))]
-    col = img.w // 2  # top edge: walk up the center column from the center row while lit (stops before the cursor/picker)
+    col = img.w // 2 + 40  # top edge: walk up a column right of center (the center has the v7 cursor ray)
     yy = y
     while yy > 0 and img.lit(col, yy - 1):
         yy -= 1

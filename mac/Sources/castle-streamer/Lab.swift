@@ -11,6 +11,9 @@ enum Lab {
 
     /// Set by Castle: fails the window's stream as an SCK error would (exercises the retry path). Returns an error.
     static var failStream: ((UInt32) -> String?)?
+    /// Set by Castle (v7): {"type":"focus","id":N} and {"type":"overlay","id":N,"visible":bool}. Return an error.
+    static var focusInject: (([String: Any]) -> String?)?
+    static var overlayInject: (([String: Any]) -> String?)?
 
     /// Lab apps may sit below normal windows (castle-testwin uses a desktop-level window): include desktop-level
     /// windows and don't require layer 0 (--only-app still filters out the wallpaper and icons).
@@ -36,6 +39,8 @@ enum Lab {
     ///   {"type":"mode","control":true}
     ///   {"type":"pointer","dx":3,"dy":-1,"buttons":0,"sx":0,"sy":0,"mods":[]}
     ///   {"type":"cursor","name":"arrow|ibeam|hand"}
+    ///   {"type":"focus","id":1026}               v7: send FOCUS_CHANGED for a window
+    ///   {"type":"overlay","id":1026,"visible":true} v7: stream a (lab) window as a launcher OVERLAY; false hides it
     ///   {"type":"fail-stream","window":1026}      simulate an SCK stream error (retry path)
     ///   {"type":"voice","text":"show slack"}      v5: run the voice planner on a transcript; reply carries "result"
     ///   {"type":"voice-pcm","path":"/x.pcm"}      v5: stream 24 kHz mono PCM16 through realtime transcription, then plan
@@ -82,6 +87,10 @@ enum Lab {
                         let r = obj["path"] is String ? voice.labPCM(obj["path"] as! String) : voice.labRun(obj["text"] as? String ?? "")
                         result = r
                         err = r["ok"] as? Bool == true ? nil : r["summary"] as? String ?? "voice failed"
+                    } else if obj["type"] as? String == "focus" {
+                        err = focusInject?(obj) ?? nil
+                    } else if obj["type"] as? String == "overlay" {
+                        err = overlayInject?(obj) ?? nil
                     } else if obj["type"] as? String == "fail-stream" {
                         let id = (obj["window"] as? NSNumber)?.uint32Value ?? 0
                         err = failStream?(id) ?? nil

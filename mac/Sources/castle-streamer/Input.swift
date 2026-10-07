@@ -162,7 +162,7 @@ private func postTagged(_ ev: CGEvent?) {
     // Posting a located mouse event warps the (detached) cursor; a big jump can leak into the next physical delta.
     if ev.type != .keyDown && ev.type != .keyUp {
         let p = ev.location
-        if let l = lastPosted { control.noteInjectedJump(hypot(p.x - l.x, p.y - l.y)) }
+        if let l = lastPosted { control.noteInjectedMove(from: l, to: p) }
         lastPosted = p
     }
     ev.post(tap: .cghidEventTap)

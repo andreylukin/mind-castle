@@ -527,7 +527,19 @@ def measure_dark_panel(img, lo=12, hi=40, min_count=8, box=None):
                 rows[y] += 1
                 first.setdefault(x, y)
                 last[x] = y
-    xs = [x for x, c in enumerate(cols) if c > min_count]
+    # Columns lit over (nearly) the whole box are a vertical line (v7 cursor ray), not a panel.
+    full = 0.9 * (by1 - by0)
+    qual = [x for x, c in enumerate(cols) if min_count < c < full]
+    # Keep the widest contiguous run of columns: thin lines (the v7 cursor ray) are separate runs.
+    runs, cur = [], []
+    for x in qual:
+        if cur and x != cur[-1] + 1:
+            runs.append(cur)
+            cur = []
+        cur.append(x)
+    if cur:
+        runs.append(cur)
+    xs = max(runs, key=len) if runs else []
     ys = [y for y, c in enumerate(rows) if c > min_count]
     if not xs or not ys:
         return None
@@ -725,18 +737,38 @@ def wait_connected(timeout=25):
 # ---------------------------------------------------------------- geometry helpers for scenarios
 
 
-def cursor_to(theta, t, st=None, tries=3, tol=0.004):
-    """Closed-loop move of the cursor to cylinder angle [theta] (rad) / elevation tan [t].
-    Open-loop gain away from content is 1 dp per point at the hovered panel's radius; over content it's native gain,
-    so a couple of corrections may be needed."""
+# v7 pointer model (Desk.kt Accel): in space the cursor moves angularly, on a panel it moves in the panel's plane at
+# the window's native mapping (1 Mac pt = 1 window pt; picker 1 dp/pt). No headset acceleration.
+YAW_DEG_PER_PT = float(os.environ.get("LAB_YAW_DEG_PER_PT", "0.04"))
+ELEV_DEG_PER_PT = float(os.environ.get("LAB_ELEV_DEG_PER_PT", "0.03"))
+
+
+def _pts_to(st, theta, t):
+    """Mac points (dx, dy) that should move the cursor from where it is to (theta, t) under the v7 model."""
+    c = st["cursor"]
+    h = st.get("hover")
+    if h and h["id"] in st["panels"]:
+        p = st["panels"][h["id"]]
+        # Same panel under the target? Then it's a planar move at native gain.
+        u0, v0 = p["r"] * math.tan(c["theta"] - p["theta"]), p["r"] * c["t"] - p["y"]
+        u1, v1 = p["r"] * math.tan(theta - p["theta"]), p["r"] * t - p["y"]
+        if abs(u1) <= p["w"] / 2 + 28 and bar_v(p) - 30 <= v1 <= p["h"] / 2 + 28:
+            k = p["w"] / WINDOW_PTS[h["id"]] if h["id"] in WINDOW_PTS else 1.0
+            return (u1 - u0) / k, -(v1 - v0) / k
+    dth = (theta - c["theta"] + math.pi) % (2 * math.pi) - math.pi
+    de = math.atan(t) - math.atan(c["t"])
+    return dth / math.radians(YAW_DEG_PER_PT), -de / math.radians(ELEV_DEG_PER_PT)
+
+
+def cursor_to(theta, t, st=None, tries=4, tol=0.004):
+    """Closed-loop move of the cursor to cylinder angle [theta] (rad) / elevation tan [t] with slow
+    (unaccelerated) moves; a few corrections absorb panel-edge detents and model error."""
     st = st or state()
     for _ in range(tries):
         c = st["cursor"]
         if abs(c["theta"] - theta) < tol and abs(c["t"] - t) < tol:
             return st
-        r = _cursor_r(st)
-        g = _gain(st)
-        move_smooth((theta - c["theta"]) * r / g, -(t - c["t"]) * r / g)
+        move_smooth(*_pts_to(st, theta, t))
         st = state()
     return st
 

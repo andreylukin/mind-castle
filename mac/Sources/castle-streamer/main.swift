@@ -11,6 +11,9 @@ final class Castle {
     private var listJSON = Data()
     private var streams: [UInt32: WindowStream] = [:]
     private var subscribed = Set<UInt32>()
+    private var overlays: [UInt32: String] = [:] // v7: visible launcher windows (id -> app), streamed without SUBSCRIBE
+    let focusWatcher = FocusWatcher()
+    let overlayWatcher = OverlayWatcher()
     /// Restart attempts after a stream died on its own; reset once a failure is >30 s after the previous one.
     private var retries: [UInt32: (count: Int, last: Date)] = [:]
     private static let retryDelays: [Double] = [1, 2, 4]
@@ -30,6 +33,17 @@ final class Castle {
                     return nil
                 }
             }
+        }
+        if Lab.enabled {
+            // Lab: no real focus/overlay watching (it would leak the user's desktop); injects drive both instead.
+            Lab.focusInject = { obj in self.stateQ.sync { self.labFocus(obj) } }
+            Lab.overlayInject = { obj in self.stateQ.sync { self.labOverlay(obj) } }
+        } else {
+            focusWatcher.send = { [weak self] d in _ = self?.sendToHeadset(Msg.focusChanged, d) }
+            focusWatcher.isOverlayApp = overlayWatcher.isOverlayApp
+            overlayWatcher.report = { [weak self] now in self?.stateQ.async { self?.overlaysNow(now) } }
+            focusWatcher.start()
+            overlayWatcher.start()
         }
         try server.start(port: port)
         log("listening on 127.0.0.1:\(port)")
@@ -86,7 +100,7 @@ final class Castle {
         listJSON = data
         client?.send(Msg.windowList, 0, data)
         for (id, s) in streams {
-            if let w = windows[id] { s.resize(w) } else { stopStream(id, gone: true) }
+            if let w = windows[id] { s.resize(w) } else if overlays[id] == nil { stopStream(id, gone: true) }
         }
     }
 
@@ -118,6 +132,7 @@ final class Castle {
         for id in streams.keys { stopStream(id, gone: false) }
         subscribed = []
         retries = [:]
+        overlays = [:]
     }
 
     private func startStream(_ w: SCWindow, _ c: Client) {
@@ -141,7 +156,7 @@ final class Castle {
     private func retryOrGone(_ id: UInt32, _ c: Client) {
         var r = retries[id] ?? (0, .distantPast)
         if Date().timeIntervalSince(r.last) > 30 { r.count = 0 }
-        guard windows[id] != nil, r.count < Self.retryDelays.count else {
+        guard windows[id] != nil || overlays[id] != nil, r.count < Self.retryDelays.count else {
             retries[id] = nil
             subscribed.remove(id)
             c.send(Msg.windowGone, id)
@@ -154,11 +169,81 @@ final class Castle {
         retries[id] = r
         log("window \(id): stream failed, retry \(r.count)/\(Self.retryDelays.count) in \(Int(delay)) s")
         stateQ.asyncAfter(deadline: .now() + delay) { [weak self, weak c] in
-            guard let self, let c, c === client, subscribed.contains(id), streams[id] == nil else { return }
+            guard let self, let c, c === client, subscribed.contains(id) || overlays[id] != nil, streams[id] == nil else { return }
+            if overlays[id] != nil { return startOverlayStream(id, c) }
             guard let w = windows[id] else { return retryOrGone(id, c) }
             log("window \(id): restarting capture (retry \(r.count))")
             startStream(w, c)
         }
+    }
+
+    // MARK: v7 overlays (launchers) and lab focus
+
+    /// The overlay watcher's current set: show new ones (OVERLAY visible + stream), hide gone ones. On stateQ.
+    private func overlaysNow(_ now: [CGWindowID: OverlayWatcher.Seen]) {
+        guard let c = client else { return }
+        for (id, o) in now where overlays[id] == nil { showOverlay(id, app: o.app, frame: o.bounds, c) }
+        for id in overlays.keys where now[id] == nil { hideOverlay(id, c) }
+    }
+
+    private func showOverlay(_ id: UInt32, app: String, frame: CGRect, _ c: Client) {
+        overlays[id] = app
+        let (w, h) = pixelSize(frame)
+        let obj: [String: Any] = ["id": id, "app": app, "visible": true, "w": w, "h": h]
+        c.send(Msg.overlay, id, (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? Data())
+        log("overlay: \(app) window \(id) visible \(w)x\(h)")
+        startOverlayStream(id, c)
+    }
+
+    private func hideOverlay(_ id: UInt32, _ c: Client) {
+        guard let app = overlays.removeValue(forKey: id) else { return }
+        retries[id] = nil
+        stopStream(id, gone: false)
+        let obj: [String: Any] = ["id": id, "app": app, "visible": false]
+        c.send(Msg.overlay, id, (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? Data())
+        log("overlay: \(app) window \(id) hidden")
+    }
+
+    /// Overlay windows aren't in `windows` (non-zero layer), so look the SCWindow up directly.
+    private func startOverlayStream(_ id: UInt32, _ c: Client) {
+        if let w = windows[id] { return startStream(w, c) }
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, err in
+            let w = content?.windows.first { $0.windowID == id }
+            self.stateQ.async {
+                guard self.overlays[id] != nil, c === self.client, self.streams[id] == nil else { return }
+                guard let w else { return log("overlay: window \(id) not capturable (\(err?.localizedDescription ?? "not listed"))") }
+                self.startStream(w, c)
+            }
+        }
+    }
+
+    /// Lab {"type":"focus","id":N}: send FOCUS_CHANGED as the focus watcher would. On stateQ.
+    private func labFocus(_ obj: [String: Any]) -> String? {
+        guard let c = client else { return "no headset client connected" }
+        guard let id = (obj["id"] as? NSNumber)?.uint32Value else { return "focus needs \"id\"" }
+        let w = windows[id]
+        let out: [String: Any] = ["id": id, "app": obj["app"] as? String ?? w?.owningApplication?.applicationName ?? "",
+                                  "title": obj["title"] as? String ?? w?.title ?? ""]
+        c.send(Msg.focusChanged, 0, (try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])) ?? Data())
+        log("lab: FOCUS_CHANGED window \(id)")
+        return nil
+    }
+
+    /// Lab {"type":"overlay","id":N,"visible":true|false}: treat a (lab) window as a launcher overlay. On stateQ.
+    private func labOverlay(_ obj: [String: Any]) -> String? {
+        guard let c = client else { return "no headset client connected" }
+        guard let id = (obj["id"] as? NSNumber)?.uint32Value, let visible = obj["visible"] as? Bool else {
+            return "overlay needs \"id\" and \"visible\""
+        }
+        if visible {
+            guard let w = windows[id] else { return "window \(id) not in the window list" }
+            if overlays[id] == nil {
+                showOverlay(id, app: obj["app"] as? String ?? w.owningApplication?.applicationName ?? "Lab", frame: w.frame, c)
+            }
+        } else {
+            hideOverlay(id, c)
+        }
+        return nil
     }
 
     private func stopStream(_ id: UInt32, gone: Bool) {
@@ -176,7 +261,7 @@ final class Castle {
         case Msg.subscribe:
             let ids = Set(((obj?["ids"] as? [Any]) ?? []).compactMap { ($0 as? NSNumber)?.uint32Value })
             log("subscribe \(ids.sorted())")
-            for id in streams.keys where !ids.contains(id) { stopStream(id, gone: false) }
+            for id in streams.keys where !ids.contains(id) && overlays[id] == nil { stopStream(id, gone: false) }
             subscribed = ids
             retries = retries.filter { ids.contains($0.key) }
             for id in ids where streams[id] == nil {
@@ -196,8 +281,10 @@ final class Castle {
             let title = w.title ?? ""
             let x = (obj?["x"] as? NSNumber)?.doubleValue ?? 0.5, y = (obj?["y"] as? NSNumber)?.doubleValue ?? 0.5
             let dx = (obj?["dx"] as? NSNumber)?.int32Value ?? 0, dy = (obj?["dy"] as? NSNumber)?.int32Value ?? 0
-            inputQ.async {
+            focusWatcher.noteOwnActivation(wid)
+            inputQ.async { [focusWatcher] in
                 focusWindow(id: wid, pid: pid, title: title)
+                focusWatcher.noteOwnActivation(wid) // the activation lands now: no FOCUS_CHANGED echo
                 guard type != Msg.focus else { return }
                 usleep(50_000) // let the raise land before injecting
                 if type == Msg.click { click(id: wid, x: x, y: y) } else { scroll(id: wid, x: x, y: y, dx: dx, dy: dy) }
@@ -207,7 +294,11 @@ final class Castle {
             let title = w.title ?? "", t = ProcessInfo.processInfo.systemUptime
             let kind = obj?["kind"] as? String ?? "", button = (obj?["button"] as? NSNumber)?.intValue ?? 0
             let x = (obj?["x"] as? NSNumber)?.doubleValue ?? 0.5, y = (obj?["y"] as? NSNumber)?.doubleValue ?? 0.5
-            inputQ.async { mouse(id: wid, pid: pid, title: title, kind: kind, x: x, y: y, button: button, t: t) }
+            if kind == "down" { focusWatcher.noteOwnActivation(wid) }
+            inputQ.async { [focusWatcher] in
+                mouse(id: wid, pid: pid, title: title, kind: kind, x: x, y: y, button: button, t: t)
+                if kind == "down" { focusWatcher.noteOwnActivation(wid) }
+            }
         default:
             log("unknown message type \(type)")
         }
@@ -254,6 +345,9 @@ if Lab.enabled {
 }
 
 control.autoControl = !args.contains("--no-auto-control")
+Trace.shared.traceInput = args.contains("--trace-input")
+control.warpCompensate = args.contains("--warp-compensate")
+control.detachCursor = !args.contains("--no-detach")
 control.start(lab: Lab.enabled)
 let virtualDisplay = args.contains("--virtual-display") && !Lab.enabled ? VirtualDisplay() : nil
 

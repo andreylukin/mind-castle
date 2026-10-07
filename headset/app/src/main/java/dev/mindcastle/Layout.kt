@@ -188,3 +188,19 @@ class Rooms(private val get: (String) -> String?, private val put: (String, Stri
         const val MIGRATED_TO = "layout.migratedTo"
     }
 }
+
+/** PROTOCOL v7 OVERLAY: a transient launcher/popup window (Raycast…), streamed while [visible]. */
+data class Overlay(val id: Int, val app: String, val visible: Boolean, val w: Int, val h: Int) {
+    companion object {
+        fun parse(json: String): Overlay = JSONObject(json).run {
+            Overlay(getInt("id"), optString("app"), optBoolean("visible"), optInt("w", 1200), optInt("h", 800))
+        }
+    }
+}
+
+/** PROTOCOL v7 FOCUS_CHANGED payload (only the id is needed; app/title are for the log). */
+data class FocusChanged(val id: Int, val app: String, val title: String) {
+    companion object {
+        fun parse(json: String): FocusChanged = JSONObject(json).run { FocusChanged(getInt("id"), optString("app"), optString("title")) }
+    }
+}

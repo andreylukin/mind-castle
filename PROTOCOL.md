@@ -145,3 +145,16 @@ Mac -> headset, new:
 - `host`: the Mac's ComputerName (System Settings > General > Sharing), for display.
 - `id`: a random UUID created once per Mac and stored in `~/.mind-castle/id` (outside the repo, so it survives rebuilds and re-clones). Key per-host state (layouts) on this, not on `host`.
 - `version`: `git rev-parse --short HEAD` of the build (`-dirty` if the mac/ tree had local changes; `unknown` if built outside git), written by `mac/build.sh` to `castle-version` next to the binary.
+
+## v7: follow Mac focus + launcher overlays (Raycast etc.)
+
+Mac -> headset, new:
+
+| type | name | payload |
+|---|---|---|
+| 23 | FOCUS_CHANGED | JSON `{"id":123,"app":"Slack","title":"…"}` — the frontmost Mac window changed for any reason (Raycast hotkey, ⌘-Tab, click). Not sent for changes the headset itself caused (our own FOCUS/MOUSE) within ~300 ms. |
+| 24 | OVERLAY | JSON `{"id":456,"app":"Raycast","visible":true,"w":…,"h":…}` — a transient launcher/popup window (Raycast, Spotlight, Alfred, or any non-layer-0 window owned by a configured overlay app) appeared/disappeared. While visible, its video is streamed automatically (no SUBSCRIBE needed) with the normal CODEC_CONFIG/FRAME messages on its id. |
+
+Headset behavior:
+- FOCUS_CHANGED: if the window is shown, make it the active panel, flash its outline, and move the cursor onto it (center, or keep relative position if already there); if not shown, show it at its remembered spot (or next to the active panel) and do the same. If it's off-view, show an edge arrow toward it.
+- OVERLAY: draw it as a floating panel straight ahead at eye level, ~0.9 m, in front of everything, with no grab bar; keyboard goes to it on the Mac anyway. Remove it when `visible:false`. Overlay panels must reuse ONE persistent panel slot (input-channel leak).
