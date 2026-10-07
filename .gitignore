@@ -1,0 +1,17 @@
+# build output
+mac/.build/
+headset/.gradle/
+headset/build/
+headset/app/build/
+headset/local.properties
+# lab artifacts
+lab/out/
+lab/.venv/
+lab/gen/
+__pycache__/
+*.h264
+*.png
+# secrets / local
+.env
+*.key
+*.log
