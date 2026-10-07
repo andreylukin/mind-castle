@@ -140,7 +140,7 @@ Mac -> headset, new:
 
 | type | name | payload |
 |---|---|---|
-| 22 | HELLO | JSON `{"host":"Work MacBook Pro","id":"5B527021-…","version":"d477183"}` — sent **first** on every connect, before WINDOW_LIST. |
+| 22 | HELLO | JSON `{"host":"Work MacBook Pro","id":"00000000-0000-0000-0000-000000000000","version":"d477183"}` — sent **first** on every connect, before WINDOW_LIST. |
 
 - `host`: the Mac's ComputerName (System Settings > General > Sharing), for display.
 - `id`: a random UUID created once per Mac and stored in `~/.mind-castle/id` (outside the repo, so it survives rebuilds and re-clones). Key per-host state (layouts) on this, not on `host`.
