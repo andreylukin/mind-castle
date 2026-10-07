@@ -40,9 +40,9 @@ final class EditorView: NSView {
 final class TerminalView: NSView {
     override var isFlipped: Bool { true }
     let text = [
-        "andrey@castle ~/repos/mind-castle % ls", "PROTOCOL.md  headset  mac", "andrey@castle ~/repos/mind-castle % swift build -c release",
-        "Building for production...", "Build complete! (5.28s)", "andrey@castle ~/repos/mind-castle % git status",
-        "On branch main", "nothing to commit, working tree clean", "andrey@castle ~/repos/mind-castle % ",
+        "user@castle ~/repos/mind-castle % ls", "PROTOCOL.md  headset  mac", "user@castle ~/repos/mind-castle % swift build -c release",
+        "Building for production...", "Build complete! (5.28s)", "user@castle ~/repos/mind-castle % git status",
+        "On branch main", "nothing to commit, working tree clean", "user@castle ~/repos/mind-castle % ",
     ]
     override func draw(_ r: NSRect) {
         NSColor(red: 0.05, green: 0.07, blue: 0.1, alpha: 1).setFill() // near-black

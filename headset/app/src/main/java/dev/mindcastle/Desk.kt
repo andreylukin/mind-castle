@@ -144,8 +144,6 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
         const val MAX_T = 1.7320508f // cursor elevation limit (tan 60°); around the arc the cursor wraps freely
         const val JUMP_IDLE_MS = 500L
         const val TIDY_MAX_DEG = 50f // widest a window gets when tidied
-        const val TIDY_IF_DEG_AROUND = 100f // auto-tidy a restore that left a panel further round than this...
-        const val TIDY_IF_DEG_UPDOWN = 40f // ...or further above/below eye level than this
         const val GESTURE_GAP_MS = 150L // a pause this long ends a travel gesture (for the log)
         const val FLASH_MS = 1200L // focus: outline flash length
         const val OVERSHOOT = 60f // dp of continued push past a captured window's edge before the cursor leaves
@@ -390,7 +388,6 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
         if (ph != pk.h) _panels[PICKER] = pk.copy(y = pk.y + pk.h / 2 - ph / 2, h = ph)
         val changed = gone.isNotEmpty() || restored
         if (changed) { remember(); rebase() }
-        if (restored && needsTidy()) tidy()
         onChange()
         return changed
     }
@@ -764,9 +761,6 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
         onChange()
         return "tidy: ${order.size} panels across %.0f°".format(Math.toDegrees(total.toDouble()))
     }
-
-    /** True if some panel is way off to the side or up/down (e.g. restored from a different posture). */
-    fun needsTidy(): Boolean = _panels.values.any { abs(wrapAngle(it.theta)) > rad(TIDY_IF_DEG_AROUND) || abs(it.pitch) > rad(TIDY_IF_DEG_UPDOWN) }
 
     /**
      * Direction (radians, 0 = right, π/2 = up, in the cursor's view) from the cursor to the nearest panel

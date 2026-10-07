@@ -89,7 +89,6 @@ import androidx.xr.runtime.math.Vector3
 import androidx.xr.scenecore.Entity
 import androidx.xr.scenecore.SpatialEnvironment
 import androidx.xr.scenecore.PointerCaptureComponent
-import androidx.xr.scenecore.SpatialPointerComponent
 import androidx.xr.scenecore.SpatialPointerIcon
 import androidx.xr.compose.subspace.layout.pointerHoverIcon
 import androidx.xr.scenecore.scene
@@ -487,17 +486,28 @@ fun ShellMesh(session: Session?, origin: Entity?, geo: Shell.Geometry, alpha: Fl
         if (alpha <= 0f) { drop(); Log.i("Castle", "shell: hidden"); return@LaunchedEffect }
         val m = Shell.mesh(geo)
         val bytes = Glb.write(m.positions, m.indices, floatArrayOf(0f, 0f, 0f, alpha))
+        // Nothing that can throw after the entity exists: a half-built shell that never reaches
+        // current[0] would never be disposed and would black out the room for good. (No pointer
+        // component on it — that NPE'd on re-create; pointer capture already hides the system pointer.)
+        var model: GltfModel? = null
         runCatching {
             @Suppress("RestrictedApi") // the ByteArray overload is the only way to load a generated .glb
-            val model = GltfModel.create(s, bytes, "shell-%08x".format(bytes.contentHashCode()))
-            model to GltfModelEntity.create(s, model, parent = o).also { e ->
-                // No system pointer over the shell (belt and braces next to pointer capture).
-                e.addComponent(SpatialPointerComponent.create(s).also { it.spatialPointerIcon = SpatialPointerIcon.NONE })
-            }
+            val gm = GltfModel.create(s, bytes, "shell-%08x".format(bytes.contentHashCode())).also { model = it }
+            gm to GltfModelEntity.create(s, gm, parent = o)
         }.onSuccess {
             drop(); current[0] = it
             Log.i("Castle", "shell: gltf ${m.positions.size / 3} vertices ${m.indices.size / 3} triangles alpha=%.2f cutout=±%.1f° top %.0f°".format(alpha, geo.cutHalfYaw, geo.cutTop))
-        }.onFailure { if (it is CancellationException) throw it; Log.e("Castle", "shell: gltf failed", it) }
+        }.onFailure {
+            model?.runCatching { close() }
+            if (it is CancellationException) throw it
+            Log.e("Castle", "shell: gltf failed", it)
+        }
+    }
+    // The shell is the blackout; the room behind it must always be passthrough (never a black environment).
+    LaunchedEffect(session, alpha) {
+        val env = session?.scene?.spatialEnvironment ?: return@LaunchedEffect
+        env.preferredPassthroughOpacity = 1f
+        Log.i("Castle", "shell: alpha=%.2f passthrough preferred=1 current=%.2f".format(alpha, env.currentPassthroughOpacity))
     }
     DisposableEffect(Unit) { onDispose { drop() } }
 }

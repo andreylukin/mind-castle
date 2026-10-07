@@ -49,6 +49,12 @@ final class Trace {
         timer = t
     }
 
+    /// One POINTER as sent in control mode (trackpad deltas only, no screen content), for gesture replay tests.
+    func pointer(dx: Double, dy: Double, buttons: Int, sx: Double, sy: Double) {
+        let t = hostMicros()
+        q.async { [self] in write(["type": "ptr", "t": t, "dx": dx, "dy": dy, "buttons": buttons, "sx": sx, "sy": sy]) }
+    }
+
     func key(at t: UInt64, tap: UInt64, isRepeat: Bool) {
         q.async { [self] in
             keys.append(t)

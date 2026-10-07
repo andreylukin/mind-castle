@@ -114,10 +114,19 @@ final class ControlMode {
         CFRunLoopWakeUp(rl)
     }
 
+    /// Enter control mode automatically when a headset connects (it connects only while the app is in use).
+    /// `--no-auto-control` turns this off; a manual ⌃⌥⌘M OFF sticks until the next connect.
+    var autoControl = true
+
     func clientConnected(_ send: @escaping (UInt8, Data) -> Void) {
         perform { [self] in
             self.send = send
-            sendMode()
+            if autoControl && !isOn {
+                log("control: auto ON (headset active)")
+                setOn(true) // sends MODE {control:true}
+            } else {
+                sendMode()
+            }
             if isOn, let cursor { DispatchQueue.main.async { cursor.start() } } // resend the current cursor
         }
     }
@@ -383,6 +392,8 @@ final class ControlMode {
 
     private func flush() {
         lastSent = now()
+        // Real trackpad input, recorded for test replay (deltas only).
+        Trace.shared.pointer(dx: acc.dx, dy: acc.dy, buttons: acc.buttons, sx: acc.sx, sy: acc.sy)
         send?(Msg.pointer, acc.take())
         statPointers += 1
         if lastSent - statSince >= 2 {
@@ -447,6 +458,7 @@ func controlSelfTest() -> Bool {
     }
 
     let c = ControlMode()
+    c.autoControl = false // the manual-toggle checks below start from OFF
     var clock = 0.0
     var timers: [(Double, () -> Void)] = []
     var applied: [Bool] = []
@@ -572,6 +584,32 @@ func controlSelfTest() -> Bool {
     check(state(inj("drag", CGPoint(x: 150, y: 100), 1, 400.3)) == 1, "drag carries the press's click state")
     _ = inj("up", CGPoint(x: 150, y: 100), 1, 400.4)
 
+    // Auto control mode: ON when a headset connects, OFF on disconnect; manual OFF sticks until the next connect.
+    var autoApplied: [Bool] = [], autoSent: [String] = []
+    let ac = ControlMode()
+    ac.apply = { autoApplied.append($0) }
+    check(!ac.isOn, "auto: off with no headset")
+    ac.clientConnected { t, p in if t == Msg.mode { autoSent.append(String(decoding: p, as: UTF8.self)) } }
+    check(ac.isOn && autoApplied == [true] && autoSent == [#"{"control":true}"#], "auto: headset connect turns control ON (one MODE true)")
+    func acKey() { for d in [true, false] { let e = CGEvent(keyboardEventSource: nil, virtualKey: 46, keyDown: d)!; e.flags = [.maskControl, .maskAlternate, .maskCommand]; _ = ac.handle(d ? .keyDown : .keyUp, e) } }
+    acKey()
+    check(!ac.isOn && autoSent.last == #"{"control":false}"#, "auto: ⌃⌥⌘M still turns it OFF manually")
+    acKey()
+    let manualOn = ac.isOn
+    acKey()
+    check(manualOn && !ac.isOn, "auto: manual toggles still work after auto")
+    ac.clientDisconnected()
+    ac.clientConnected { t, p in if t == Msg.mode { autoSent.append(String(decoding: p, as: UTF8.self)) } }
+    check(ac.isOn, "auto: the next connect turns it ON again")
+    ac.clientDisconnected()
+    check(!ac.isOn && autoApplied.last == false, "auto: disconnect turns it OFF")
+    let nc2 = ControlMode()
+    nc2.autoControl = false
+    var nApplied: [Bool] = []
+    nc2.apply = { nApplied.append($0) }
+    nc2.clientConnected { _, _ in }
+    check(!nc2.isOn && nApplied.isEmpty, "--no-auto-control: connect leaves control OFF")
+
     // COMMAND hotkeys (v4): keycode table, swallowing, repeat rules, pass-through without a client.
     let all = [.maskControl, .maskAlternate, .maskCommand] as CGEventFlags
     let table: [(CGKeyCode, Bool, String, Bool)] = [
@@ -590,6 +628,7 @@ func controlSelfTest() -> Bool {
     ]
     var raw: [(UInt8, Data)] = []
     let rc = ControlMode()
+    rc.autoControl = false
     rc.clientConnected { t, p in raw.append((t, p)) }
     func ckey(_ code: CGKeyCode, _ down: Bool, _ flags: CGEventFlags, repeat_: Bool = false, _ m: ControlMode) -> Bool {
         let e = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down)!

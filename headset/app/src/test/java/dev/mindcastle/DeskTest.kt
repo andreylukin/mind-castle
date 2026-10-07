@@ -191,14 +191,15 @@ class DeskTest {
         assertEquals(order.toSet(), d.panels.keys)
     }
 
-    @Test fun badRestoreAutoTidies() {
+    // Regression (lab): restore used to auto-tidy a deliberately far panel (Terminal at 100.6°) on every relaunch.
+    @Test fun restoreKeepsFarPanelsExactly() {
         val d = desk()
-        d.syncWindows(listOf(MacWindow(7, "Code", "a", 1000, 500)))
-        d.moveTo(7, d.position(Panel(2.4f, 0f, 1200f, 400f, 200f))); d.commit()
+        d.syncWindows(listOf(MacWindow(7, "Terminal", "zsh", 1000, 500)))
+        d.moveTo(7, d.position(Panel(Math.toRadians(100.6).toFloat(), 500f, 1200f, 400f, 200f))); d.commit()
+        val far = d.panels.getValue(7)
         val e = Desk(1000f); e.restore(LayoutJson.read(LayoutJson.write(d.layoutState())))
-        e.syncWindows(listOf(MacWindow(70, "Code", "a", 1000, 500)))
-        assertTrue("restored panel brought back in front", kotlin.math.abs(e.panels.getValue(70).theta) < 1f)
-        assertTrue(!e.needsTidy())
+        e.syncWindows(listOf(MacWindow(70, "Terminal", "zsh", 1000, 500))) // relaunch / new window id
+        assertEquals(far, e.panels.getValue(70))
     }
 
     @Test fun arrowPointsAtNearestPanelInEmptySpace() {

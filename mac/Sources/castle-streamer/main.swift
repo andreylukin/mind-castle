@@ -253,6 +253,7 @@ if Lab.enabled {
     installKeyTap()
 }
 
+control.autoControl = !args.contains("--no-auto-control")
 control.start(lab: Lab.enabled)
 let virtualDisplay = args.contains("--virtual-display") && !Lab.enabled ? VirtualDisplay() : nil
 

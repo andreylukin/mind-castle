@@ -5,6 +5,7 @@ is in front of the eyes, the cursor works, the shell is black with the cutout be
 still pitched -> still anchored to the ceiling -> pitch back to 0 + recenter -> same geometry as at the start.
 Also records what an emulator RECENTER does while pitched (observation only: it also resets the emulator head).
 Usage: lying.py"""
+import math
 import time
 
 from _common import check, finish, lab, setup, window_ids
@@ -92,6 +93,15 @@ up1 = lab.shot("upright_end")
 check("pitch back to 0 + recenter: upright layout identical to the start (lit-mask IoU ≥ 0.85)",
       iou(m0, mask(up1)) >= 0.85, f"IoU {iou(m0, mask(up1)):.2f} | {up0} vs {up1} | {cyl}")
 st = lab.state()
-check("upright again: cylinder facing is level (|y| of facing < 0.26 ≈ 15°)", cyl and abs(float(
-    __import__("re").search(r"facing=Vec3\(x=\S+, y=(\S+),", cyl)[1])) < 0.26, cyl)
+def anchor_pitch(line):
+    import re
+    m = re.search(r"pitchDeg=(-?[\d.E-]+)", line or "")
+    if m:
+        return float(m[1])
+    m = re.search(r"facing=Vec3\(x=\S+, y=(\S+),", line or "")
+    return math.degrees(math.asin(max(-1.0, min(1.0, float(m[1].rstrip(',')))))) if m else None
+
+
+ap = anchor_pitch(cyl)
+check("upright again: layout anchor is level (|pitch| < 15°)", ap is not None and abs(ap) < 15, f"anchor pitch {ap} | {cyl}")
 finish()

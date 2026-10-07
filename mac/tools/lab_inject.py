@@ -69,7 +69,10 @@ def check(a):
     windows = json.loads(wl[1]) if wl else []
     print("windows:", [(w["id"], w["app"], w["title"]) for w in windows])
     m = recv_until(h, MODE)
-    expect(m is not None and json.loads(m[1]) == {"control": False}, f"MODE on connect: {m and m[1]}")
+    expect(m is not None and json.loads(m[1]) == {"control": True}, f"auto control: MODE on connect: {m and m[1]}")
+    inject(a.inject_port, ['{"type":"mode","control":false}'])
+    m = recv_until(h, MODE)
+    expect(m is not None and json.loads(m[1]) == {"control": False}, f"mode off -> MODE {m and m[1]}")
 
     r = inject(a.inject_port, ['{"type":"pointer","dx":1}'])[0]
     expect(r.get("ok") is False and "off" in r.get("error", ""), "pointer refused while control is off")

@@ -125,3 +125,52 @@ def learn_window_points(st):
 
 def window_ids(st):
     return [i for i in st["panels"] if i != 0]
+
+
+# ---- arranging panels with COMMANDs (the active panel is the captured one)
+
+def capture_window(st, pid):
+    """Click into window [pid]'s content so it becomes the active (captured) panel. Returns state."""
+    st = lab.cursor_to(*lab.panel_point(st, pid, 0, 0), st)
+    lab.click()
+    time.sleep(0.3)
+    return lab.state()
+
+
+def release_capture(st, pid):
+    """Leave captured window [pid] through its bottom edge (overshoot exit). Returns state."""
+    p = st["panels"][pid]
+    k = p["w"] / lab.WINDOW_PTS[pid] if pid in lab.WINDOW_PTS else 0.8
+    cv = st["cursor"]["t"] * p["r"] - p["y"]
+    lab.move_smooth(0, (cv + p["h"] / 2 + 70) / k)
+    return lab.state()
+
+
+def commands(*cmds):
+    """Run (cmd, fields) COMMANDs in a row against the active panel."""
+    for cmd, kw in cmds:
+        lab.command(cmd, **kw)
+    time.sleep(0.5)
+    return lab.state()
+
+
+def arrange(st, pid, theta_deg=None, y=None, r_steps=0, size_steps=0, preset=None):
+    """Capture [pid], optionally apply a preset, then depth/size steps, then nudge to θ (5° steps) and y (40 dp
+    steps), then release. Returns state."""
+    st = capture_window(st, pid)
+    seq = []
+    if preset:
+        seq.append(("preset", {"name": preset}))
+    seq += [("depth", {"d": 1 if r_steps > 0 else -1})] * abs(r_steps)
+    seq += [("size", {"d": 1 if size_steps > 0 else -1})] * abs(size_steps)
+    st = commands(*seq) if seq else st
+    p = st["panels"][pid]
+    seq = []
+    if theta_deg is not None:
+        n = round((theta_deg - math.degrees(p["theta"])) / 5)
+        seq += [("nudge", {"dtheta": 1 if n > 0 else -1})] * abs(n)
+    if y is not None:
+        n = round((y - p["y"]) / 40)
+        seq += [("nudge", {"dy": 1 if n > 0 else -1})] * abs(n)
+    st = commands(*seq) if seq else lab.state()
+    return release_capture(st, pid)
