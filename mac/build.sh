@@ -9,3 +9,7 @@ swift build -c release "$@"
 cp .build/release/castle-streamer .build/release/castle-streamer-b.tmp
 codesign -f -s - -i dev.mindcastle.streamer .build/release/castle-streamer-b.tmp
 mv -f .build/release/castle-streamer-b.tmp .build/release/castle-streamer-b
+# Version for HELLO (read next to the binary at runtime).
+v=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+[ -n "$(git status --porcelain -- . 2>/dev/null)" ] && v="$v-dirty"
+echo "$v" > .build/release/castle-version

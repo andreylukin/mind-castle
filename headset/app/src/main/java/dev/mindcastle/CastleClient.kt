@@ -37,6 +37,10 @@ class CastleClient(private val host: String = "127.0.0.1", private val port: Int
     /** Latest Mac cursor image, and the first one received (drawn as the arrow away from window content). */
     val cursor = MutableStateFlow<CursorImage?>(null)
     val arrow = MutableStateFlow<CursorImage?>(null)
+    /** The Mac on the other end (PROTOCOL v6 HELLO; [Host.DEFAULT] for streamers without it). */
+    val mac = MutableStateFlow<Host?>(null)
+    @Volatile private var helloThisConnection = false
+
     /** Latest push-to-talk status (PROTOCOL v5 VOICE), for the picker header. */
     val voice = MutableStateFlow<Voice?>(null)
     /** Called on the network thread for each POINTER (control mode only). */
@@ -132,6 +136,7 @@ class CastleClient(private val host: String = "127.0.0.1", private val port: Int
                     out = DataOutputStream(s.getOutputStream())
                     status.value = "connected"
                     resubscribe = true
+                    helloThisConnection = false
                     while (true) {
                         val type = inp.readUnsignedByte()
                         val id = inp.readInt()
@@ -150,9 +155,28 @@ class CastleClient(private val host: String = "127.0.0.1", private val port: Int
         }
     }
 
+    /**
+     * Network thread. A different Mac than last time: its window ids mean nothing here, so drop every
+     * decoder and the remembered subscription before any of its frames arrive.
+     */
+    private fun setHost(h: Host) {
+        helloThisConnection = true
+        val old = mac.value
+        if (old != null && old.id != h.id) {
+            decoders.values.forEach { it.release() }
+            decoders.clear()
+            lastSubscribe = emptyList()
+            windows.value = emptyList()
+        }
+        Log.i(TAG, "host: ${h.name} (${h.id}) v${h.version}" + if (old != null && old.id != h.id) " — switched from ${old.name}" else "")
+        mac.value = h
+    }
+
     private fun handle(type: Int, id: Int, p: ByteArray, recvUs: Long) {
         when (type) {
+            22 -> setHost(runCatching { Host.parse(String(p)) }.getOrDefault(Host.DEFAULT))
             1 -> {
+                if (!helloThisConnection) setHost(Host.DEFAULT) // older streamer: no HELLO before its first WINDOW_LIST
                 val a = JSONArray(String(p))
                 windows.value = (0 until a.length()).map { i ->
                     a.getJSONObject(i).run { MacWindow(getInt("id"), getString("app"), getString("title"), getInt("w"), getInt("h")) }

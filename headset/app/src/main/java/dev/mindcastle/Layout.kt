@@ -157,3 +157,34 @@ object LayoutJson {
         LayoutState(saved, c, optDouble("forward", 0.0).toFloat(), e, a)
     }
 }
+
+/** PROTOCOL v6 HELLO: which Mac this connection is. Streamers without HELLO count as [DEFAULT]. */
+data class Host(val id: String, val name: String, val version: String = "") {
+    companion object {
+        val DEFAULT = Host("default", "Mac")
+        fun parse(json: String): Host = JSONObject(json).run {
+            Host(optString("id").ifEmpty { "default" }, optString("host").ifEmpty { "Mac" }, optString("version"))
+        }
+    }
+}
+
+/**
+ * One saved layout ("room") per Mac, keyed by host id, over a plain key/value store. The pre-v6
+ * single layout is handed to the first host that connects, once.
+ */
+class Rooms(private val get: (String) -> String?, private val put: (String, String?) -> Unit) {
+    fun load(host: String): String? {
+        get(KEY + host)?.let { return it }
+        val legacy = get(LEGACY) ?: return null
+        put(KEY + host, legacy); put(LEGACY, null); put(MIGRATED_TO, host)
+        return legacy
+    }
+
+    fun save(host: String, json: String) = put(KEY + host, json)
+
+    companion object {
+        const val KEY = "layout:"
+        const val LEGACY = "layout"
+        const val MIGRATED_TO = "layout.migratedTo"
+    }
+}

@@ -99,6 +99,7 @@ final class Castle {
         client = c
         c.onNeedKeyframe = { [weak self] id in self?.stateQ.async { self?.streams[id]?.requestKeyframe() } }
         log("client connected")
+        c.send(Msg.hello, 0, HostInfo.hello) // first message: who this Mac is (v6)
         c.send(Msg.windowList, 0, listJSON.isEmpty ? Data("[]".utf8) : listJSON)
         control.clientConnected { [weak c] t, p in c?.send(t, 0, p) }
     }
@@ -216,6 +217,10 @@ final class Castle {
 // MARK: startup
 
 _ = NSApplication.shared // initializes the window-server connection ScreenCaptureKit expects
+// setup.sh: report (and optionally request) permissions, then exit before any prompt, tap or server below.
+if CommandLine.arguments.contains("--check-permissions") || CommandLine.arguments.contains("--request-permissions") {
+    exit(HostInfo.permissionsReport(request: CommandLine.arguments.contains("--request-permissions")))
+}
 
 let screenOK = CGPreflightScreenCaptureAccess()
 let axOK = AXIsProcessTrusted()

@@ -133,3 +133,15 @@ Mac details (Voice.swift):
 - VOICE sequence: `listening ""`, `listening "<cumulative transcript>"` per delta (replaces), `thinking ""` on release, `thinking "<transcript>"`, then `done "<summary>"` or `error "<message>"`.
 - COMMAND targeting: the Mac resolves the spoken name against WINDOW_LIST and sends `"window"` = that window's app name (or its title when the app has several windows) plus `"id"` (its CGWindowID); prefer `id`. Step fields (`dtheta`, `dy`, `d`) may be ±1..10 = that many steps. `show`/`hide`/`focus` always carry `window` + `id`.
 - Lab: inject `{"type":"voice","text":"…"}` runs the planner on that transcript (no mic); the reply carries `"result"` (calls, summary, timings). Mac-side tools (open_url, slack_*, focus_app, search_web) are only logged in lab.
+
+## v6: host identity
+
+Mac -> headset, new:
+
+| type | name | payload |
+|---|---|---|
+| 22 | HELLO | JSON `{"host":"Work MacBook Pro","id":"5B527021-…","version":"d477183"}` — sent **first** on every connect, before WINDOW_LIST. |
+
+- `host`: the Mac's ComputerName (System Settings > General > Sharing), for display.
+- `id`: a random UUID created once per Mac and stored in `~/.mind-castle/id` (outside the repo, so it survives rebuilds and re-clones). Key per-host state (layouts) on this, not on `host`.
+- `version`: `git rev-parse --short HEAD` of the build (`-dirty` if the mac/ tree had local changes; `unknown` if built outside git), written by `mac/build.sh` to `castle-version` next to the binary.

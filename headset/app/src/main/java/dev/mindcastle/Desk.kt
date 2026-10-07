@@ -146,6 +146,7 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
         const val TIDY_MAX_DEG = 50f // widest a window gets when tidied
         const val TIDY_IF_DEG_AROUND = 100f // auto-tidy a restore that left a panel further round than this...
         const val TIDY_IF_DEG_UPDOWN = 40f // ...or further above/below eye level than this
+        const val GESTURE_GAP_MS = 150L // a pause this long ends a travel gesture (for the log)
         const val FLASH_MS = 1200L // focus: outline flash length
         const val OVERSHOOT = 60f // dp of continued push past a captured window's edge before the cursor leaves
         const val ABSORB_MS = 300L // after leaving a window through its bottom onto the bar, eat that flick's momentum
@@ -402,6 +403,28 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
         return LayoutState(saved.toList(), center, forward, env, anchor)
     }
 
+    /** Bumped on every [loadRoom]: window ids from different Macs can collide, so panels are keyed by it. */
+    var roomEpoch = 0; private set
+
+    /**
+     * Switch to another Mac's room: forget everything about the current one (panels, windows,
+     * remembered spots, env, undo) and load [st] (null = a fresh room). The head anchor stays — it's
+     * where the user is, not a property of the Mac.
+     */
+    fun loadRoom(st: LayoutState?) {
+        // Re-key panels only if the old room had windows (first connect: keep the picker's panel — each new one leaks a channel).
+        if (_panels.size > 1 || meta.isNotEmpty()) roomEpoch++
+        release("host switch")
+        drag = null; mouse = null; hover = null; buttons = 0; lastClicked = null; flashId = null
+        _panels.clear(); _panels[PICKER] = Panel(-0.35f, 0f, defaultR, PickerMetrics.WIDTH, PickerMetrics.height(0))
+        meta.clear(); winPts.clear(); saved.clear()
+        env = Env()
+        undoStack.clear(); redoStack.clear(); lastCommitKey = null
+        committed = HashMap(_panels)
+        st?.let { restore(it) }
+        onChange()
+    }
+
     /** Load a persisted layout at launch: remembered windows come back as WINDOW_LIST shows them. */
     fun restore(st: LayoutState) {
         saved.clear(); saved += st.saved.map { it.copy(id = null) }
@@ -481,10 +504,61 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
     /** dp per Mac point where the cursor is: the window's own scale over content, GAIN elsewhere. */
     fun cursorDpPerPoint(): Float = if (overContent) hover?.let { dpPerPoint(it.id) } ?: GAIN else GAIN
 
+    /** Speed-dependent cursor gain on top of macOS's own (see [Accel]); the app turns it on, tests opt in. */
+    var acceleration = false
+    /** Smoothed pointer speed, Mac points per second. */
+    var speed = 0f; private set
+    /** Per-gesture travel summary for the log (a gesture = moves without a [GESTURE_GAP_MS] pause). */
+    var onGesture: (String) -> Unit = {}
+    private var gestureStartMs = 0L
+    private var gestureStartTheta = 0f
+    private var gesturePeak = 0f
+    private val gestureCrossed = LinkedHashSet<Int>()
+
+    /**
+     * dp per Mac point for this move. Captured: the window's own scale (precision where you work).
+     * Otherwise, with [acceleration]: slow moves over content keep native window precision, anything
+     * fast gets the accelerated global gain, and empty space is crossed at least [Accel.GAP_MIN]× faster.
+     */
+    private fun moveGain(): Float {
+        if (!acceleration) return cursorDpPerPoint()
+        val a = Accel.factor(speed)
+        val h = hover
+        return when {
+            h == null -> GAIN * max(Accel.GAP_MIN, a)
+            h.zone == Zone.CONTENT && h.id != PICKER && speed <= Accel.SLOW -> dpPerPoint(h.id) ?: GAIN
+            else -> GAIN * a
+        }
+    }
+
+    private fun trackGesture(p: Pointer, nowMs: Long, dt: Long) {
+        if (p.dx == 0f && p.dy == 0f) return
+        if (dt >= GESTURE_GAP_MS || gestureStartMs == 0L) {
+            endGesture()
+            gestureStartMs = nowMs; gestureStartTheta = cursorTheta; gesturePeak = 0f; gestureCrossed.clear()
+        }
+        gesturePeak = max(gesturePeak, speed)
+        hover?.let { gestureCrossed += it.id }
+    }
+
+    private fun endGesture() {
+        if (gestureStartMs == 0L) return
+        val d = wrapAngle(cursorTheta - gestureStartTheta)
+        if (abs(d) > 1e-3f) onGesture("travel: θ %.3f→%.3f (Δ%+.3f rad) in %d ms, peak %.0f pt/s, over %s".format(
+            gestureStartTheta, cursorTheta, d, lastPointerMs - gestureStartMs, gesturePeak, gestureCrossed.toList()))
+        gestureStartMs = 0L
+    }
+
     fun pointer(p: Pointer, nowMs: Long = 0L, gaze: (() -> Ray?)? = null): List<Action> {
         if (!control) return emptyList()
         val out = mutableListOf<Action>()
-        val idle = nowMs - lastPointerMs >= JUMP_IDLE_MS
+        val dt = nowMs - lastPointerMs
+        val idle = dt >= JUMP_IDLE_MS
+        // Speed from this message's travel over the time since the last one (≈ 8 ms at 120 Hz; a
+        // first message or a pause counts as one nominal interval), lightly smoothed.
+        val inst = hypot(p.dx, p.dy) * 1000f / (if (dt in 1..Accel.MAX_DT_MS) dt else Accel.NOMINAL_DT_MS).toFloat()
+        speed = if (dt > Accel.MAX_DT_MS) inst else 0.5f * speed + 0.5f * inst
+        trackGesture(p, nowMs, dt)
         lastPointerMs = nowMs
         // Only a plain move after a pause jumps: never a press/scroll, never mid-drag, never while
         // parked on a grab bar or corner (the user is about to grab it).
@@ -499,7 +573,7 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
         val cap = captured?.let { id -> _panels[id]?.let { id to it } }
         if (absorb) Unit
         else if (cap != null) moveCaptured(cap.first, cap.second, p.dx, p.dy)
-        else cursorDpPerPoint().let { g -> moveCursor(p.dx * g, p.dy * g) }
+        else moveGain().let { g -> moveCursor(p.dx * g, p.dy * g) }
         drag?.let { applyDrag(it) }
         hover = drag?.h ?: captured?.let { Hover(it, Zone.CONTENT) } ?: hit()
         hover?.let { cursorR = _panels.getValue(it.id).r }
@@ -808,6 +882,25 @@ class Desk(dpPerMeter: Float = 1000f, private val onChange: () -> Unit = {}) {
  * Aspect-locked resize of a w×h rect centered at the origin: corner ([cx], [cy]) moves by
  * ([ddx], [ddy]), the opposite corner stays put. Returns the new center (x, y) and width.
  */
+/**
+ * Pointer acceleration on top of macOS's: 1× up to [SLOW] pt/s, ramping linearly to [MAX]× at [FAST] pt/s,
+ * so a flick crosses the whole layout while slow moves stay exact.
+ */
+object Accel {
+    const val SLOW = 400f
+    const val FAST = 2500f
+    const val MAX = 3.5f
+    const val GAP_MIN = 1.5f // empty space always moves at least this much faster than 1×
+    const val NOMINAL_DT_MS = 8L // POINTER is coalesced to ≤120/s
+    const val MAX_DT_MS = 100L // longer than this since the last message: a new movement
+
+    fun factor(speedPtPerS: Float): Float = when {
+        speedPtPerS <= SLOW -> 1f
+        speedPtPerS >= FAST -> MAX
+        else -> 1f + (MAX - 1f) * (speedPtPerS - SLOW) / (FAST - SLOW)
+    }
+}
+
 /** Angle wrapped to [-π, π). */
 fun wrapAngle(a: Float): Float {
     val twoPi = (2 * Math.PI).toFloat()

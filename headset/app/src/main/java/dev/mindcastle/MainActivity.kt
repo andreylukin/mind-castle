@@ -106,7 +106,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 class MainActivity : ComponentActivity() {
     private val client = CastleClient()
     private val main = Handler(Looper.getMainLooper())
-    private val desk: Desk by lazy { Desk { tick.value++ }.apply { lookToJump = false } }
+    private val desk: Desk by lazy {
+        Desk { tick.value++ }.apply {
+            lookToJump = false
+            acceleration = true
+            onGesture = { Log.d("Castle", it) }
+        }
+    }
     /** Bumped on every Desk change; Desk itself is plain Kotlin touched only on the main thread. */
     private val tick = MutableStateFlow(0)
     private var pointerCount = 0
@@ -119,7 +125,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        restoreLayout()
         desk.onLayoutChange = { main.removeCallbacks(saveLayout); main.postDelayed(saveLayout, 500) }
         client.onCommand = { json -> main.post { command(json) } }
         desk.onCapture = { id, why -> Log.i("Castle", if (id != null) "capture: start window $id ($why)" else "capture: end ($why)") }
@@ -140,23 +145,36 @@ class MainActivity : ComponentActivity() {
         }
         client.start()
         window.decorView.setBackgroundColor(android.graphics.Color.BLACK)
-        setContent { Castle(client, desk, tick, resumes, recenterRequests, foreground, ::toggle) { gaze = it } }
+        setContent { Castle(client, desk, tick, resumes, recenterRequests, foreground, roomHost, ::switchHost, ::toggle) { gaze = it } }
     }
 
     /** Bumped by the "recenter" COMMAND; Castle re-centers on the head like the headset's recenter button. */
     private val recenterRequests = MutableStateFlow(0)
     private val prefs by lazy { getSharedPreferences("castle", MODE_PRIVATE) }
+    /** One saved layout per Mac (PROTOCOL v6 HELLO host id). */
+    private val rooms by lazy {
+        Rooms({ prefs.getString(it, null) }, { k, v -> prefs.edit().apply { if (v == null) remove(k) else putString(k, v) }.apply() })
+    }
+    /** Host id whose room the Desk currently holds; null until the first Mac says who it is. */
+    private val roomHost = MutableStateFlow<String?>(null)
+
     private val saveLayout = Runnable {
+        val host = roomHost.value ?: return@Runnable
         val st = desk.layoutState()
-        prefs.edit().putString("layout", LayoutJson.write(st)).apply()
-        Log.i("Castle", "layout: saved ${st.saved.size} panels env=${st.env}")
+        rooms.save(host, LayoutJson.write(st))
+        Log.i("Castle", "layout: saved ${st.saved.size} panels for $host env=${st.env}")
     }
 
-    private fun restoreLayout() {
-        val json = prefs.getString("layout", null) ?: return
-        runCatching { desk.restore(LayoutJson.read(json)) }
-            .onSuccess { Log.i("Castle", "layout: restored ${desk.layoutState().saved.size} remembered panels env=${desk.env} anchor=${desk.anchor}") }
-            .onFailure { Log.w("Castle", "layout: unreadable, starting fresh", it) }
+    /** A (different) Mac connected: save the old room, load this one's (or start fresh). Main thread. */
+    private fun switchHost(h: Host) {
+        if (roomHost.value == h.id) return
+        roomHost.value?.let { main.removeCallbacks(saveLayout); saveLayout.run() }
+        val st = rooms.load(h.id)?.let { json ->
+            runCatching { LayoutJson.read(json) }.onFailure { Log.w("Castle", "layout: unreadable for ${h.id}, starting fresh", it) }.getOrNull()
+        }
+        desk.loadRoom(st)
+        roomHost.value = h.id
+        Log.i("Castle", "layout: restored ${desk.layoutState().saved.size} remembered panels for ${h.name} (${h.id}) env=${desk.env} anchor=${desk.anchor}")
     }
 
     private fun command(json: String) {
@@ -212,6 +230,7 @@ class MainActivity : ComponentActivity() {
 fun Castle(
     client: CastleClient, desk: Desk, tick: MutableStateFlow<Int>, resumes: MutableStateFlow<Int>,
     recenterRequests: MutableStateFlow<Int>, foreground: MutableStateFlow<Boolean>,
+    roomHost: MutableStateFlow<String?>, switchHost: (Host) -> Unit,
     toggle: (Int) -> Unit, setGaze: ((() -> Ray?)?) -> Unit,
 ) {
     val session = LocalSession.current
@@ -242,7 +261,11 @@ fun Castle(
         if (v.state == "done" || v.state == "error") { delay(4000); client.voice.value = null }
     }
     LaunchedEffect(control) { desk.control = control }
-    LaunchedEffect(windows) { if (desk.syncWindows(windows)) client.subscribe(desk.shown) }
+    val host by client.mac.collectAsState()
+    val room by roomHost.collectAsState()
+    LaunchedEffect(host) { host?.let(switchHost) }
+    // Only sync once the Desk holds this Mac's room (window ids are per Mac).
+    LaunchedEffect(windows, room) { if (room != null && room == host?.id && desk.syncWindows(windows)) client.subscribe(desk.shown) }
     val density = LocalDensity.current.density
     // Entity at the anchored layout origin (head poses in its frame = layout-frame dp; the shell hangs off it),
     // and one at the plain Subspace origin, to measure the head for a new anchor.
@@ -318,10 +341,11 @@ fun Castle(
             val h = desk.hover
             // In control mode the finger resting on the trackpad reads as a hand pointer: hands off.
             val hands = !control
-            val kept = remember { LinkedHashMap<Int, Panel>() } // id -> last shown geometry
+            val kept = remember(desk.roomEpoch) { LinkedHashMap<Int, Panel>() } // id -> last shown geometry (this Mac's)
             for ((id, p) in panels) kept[id] = p
             kept.keys.retainAll { it == Desk.PICKER || windows.any { w -> w.id == it } }
-            for ((id, last) in kept.entries.toList()) key(id) {
+            // Keyed by room too: another Mac's window ids can collide with this one's.
+            for ((id, last) in kept.entries.toList()) key(desk.roomEpoch, id) {
                 val p = panels[id] // null: hidden by the user, parked
                 val chrome = if (p == null) Chrome.State() else Chrome.State(
                     outline = control && h?.id == id || desk.flashId == id && System.currentTimeMillis() < desk.flashUntilMs,
@@ -334,7 +358,7 @@ fun Castle(
                 if (id == Desk.PICKER) {
                     // Square panel: the chrome's corner handles sit in the corners a rounded panel would clip.
                     SpatialPanel(mod, shape = SpatialRoundedCornerShape(CornerSize(0.dp))) {
-                        PickerChrome(last, chrome) { Picker(status, control, voice, windows, desk.shown, toggle) }
+                        PickerChrome(last, chrome) { Picker(host?.name ?: "Mac", status, control, voice, windows, desk.shown, toggle) }
                     }
                 } else {
                     windows.firstOrNull { it.id == id }?.let { w -> WindowPanel(client, w, p ?: last, chrome, mod, desk::noteClicked) }
@@ -522,12 +546,12 @@ fun panelModifier(desk: Desk, id: Int, p: Panel, parked: Boolean, resizable: Boo
 }
 
 @Composable
-fun Picker(status: String, control: Boolean, voice: Voice?, windows: List<MacWindow>, shown: List<Int>, toggle: (Int) -> Unit) {
+fun Picker(hostName: String, status: String, control: Boolean, voice: Voice?, windows: List<MacWindow>, shown: List<Int>, toggle: (Int) -> Unit) {
     // Fixed row heights (PickerMetrics) so the Mac cursor can hit-test rows without Compose.
     Column(Modifier.fillMaxSize().background(Color(0xFF151515)).padding(PickerMetrics.PAD.dp)) {
         Box(Modifier.height(PickerMetrics.HEADER.dp).fillMaxWidth(), contentAlignment = Alignment.CenterStart) {
             if (voice != null) VoiceLine(voice)
-            else Text("Mac · $status" + if (control) " · CONTROL" else "",
+            else Text(hostName + (if (status == "connected") "" else " · $status") + if (control) " · CONTROL" else "",
                 color = if (control) Color(0xFF7FD4FF) else Color.Gray, fontSize = 16.sp, maxLines = 1)
         }
         for (w in windows) {
